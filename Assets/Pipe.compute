@@ -1,0 +1,53 @@
+#pragma kernel Advance
+#pragma kernel Render
+
+#define SHADES 8
+
+RWStructuredBuffer<uint> Buf;       // [lane * Length + p]
+RWTexture2D<float4> Result;         // Length x Lanes
+float4 Palette[16 * SHADES];
+float4 EmptyColor;
+
+int Length;
+int Lanes;
+
+// Mỗi thread xử lý 1 lane: duyệt từ cuối về đầu để cả đoàn hạt dịch 1 ô cùng lúc.
+[numthreads(64, 1, 1)]
+void Advance(uint3 id : SV_DispatchThreadID)
+{
+    int lane = (int)id.x;
+    if (lane >= Lanes)
+        return;
+
+    uint b = (uint)lane * (uint)Length;
+
+    for (int p = Length - 2; p >= 0; p--)
+    {
+        uint v = Buf[b + p];
+        if (v != 0 && Buf[b + p + 1] == 0)
+        {
+            Buf[b + p + 1] = v;
+            Buf[b + p] = 0;
+        }
+    }
+}
+
+[numthreads(8, 8, 1)]
+void Render(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x >= Length || (int)id.y >= Lanes)
+        return;
+
+    uint v = Buf[id.y * Length + id.x];
+    uint type = v & 15u;
+
+    if (type == 0)
+    {
+        Result[id.xy] = EmptyColor;
+    }
+    else
+    {
+        uint shade = (v >> 4) & (SHADES - 1);
+        Result[id.xy] = Palette[type * SHADES + shade];
+    }
+}

@@ -1,0 +1,249 @@
+#pragma kernel Clear
+#pragma kernel ClearNext
+#pragma kernel AddSand
+#pragma kernel Simulate
+#pragma kernel Render
+#pragma kernel Extract
+#pragma kernel Inject
+
+// Mỗi ô là 1 uint:  bit 0-3 = loại cát (0 = trống, 1..15)
+//                   bit 4-6 = sắc độ (shade 0..7) trong cùng 1 loại
+// Hạt di chuyển thì chép nguyên cả uint nên màu đi theo hạt.
+#define SHADES 8
+
+RWStructuredBuffer<uint> Current;
+RWStructuredBuffer<uint> Next;
+RWTexture2D<float4> Result;
+
+float4 Palette[16 * SHADES];   // Palette[type * SHADES + shade]; type 0 = trong suốt
+
+int Width;
+int Height;
+int BrushX;
+int BrushY;
+int BrushRadius;
+int BrushType;        // 0 = cục tẩy, 1..15 = loại cát
+int BrushTypeDel;     // loại bị tẩy khi BrushType == 0; số âm = tẩy tất cả
+int Frame;
+
+// ---- Cổng nối với ống ----
+RWStructuredBuffer<uint> PipeBuf;   // [lane * PipeLength + p], p = 0 là đầu ống (phía nguồn)
+int PipeLength;
+int PortSide;    // 0 = đáy, 1 = đỉnh, 2 = trái, 3 = phải
+int PortOffset;  // vị trí ô đầu tiên của cổng dọc theo cạnh
+int PortLanes;   // số ô của cổng = số lane của ống
+int PortFlip;    // 1 = đảo chiều lane so với chiều tăng dần dọc cạnh
+int PortHeight;  // bề dày (pixel) tầng được phép lấy, tính từ cạnh vào trong
+
+uint Hash(uint x)
+{
+    x ^= x >> 16; x *= 0x7feb352du;
+    x ^= x >> 15; x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+[numthreads(8, 8, 1)]
+void Clear(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x >= Width || (int)id.y >= Height)
+        return;
+
+    uint index = id.y * Width + id.x;
+    Current[index] = 0;
+    Next[index] = 0;
+}
+
+[numthreads(8, 8, 1)]
+void ClearNext(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x >= Width || (int)id.y >= Height)
+        return;
+
+    Next[id.y * Width + id.x] = 0;
+}
+
+[numthreads(8, 8, 1)]
+void AddSand(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x >= Width || (int)id.y >= Height)
+        return;
+
+    int dx = (int)id.x - BrushX;
+    int dy = (int)id.y - BrushY;
+
+    if (dx * dx + dy * dy > BrushRadius * BrushRadius)
+        return;
+
+    uint index = id.y * Width + id.x;
+    uint value = Current[index];
+
+    if (BrushType == 0)
+    {
+        // Tẩy: tất cả (BrushTypeDel < 0) hoặc chỉ 1 loại
+        if (BrushTypeDel < 0 || (value & 15u) == (uint)BrushTypeDel)
+            Current[index] = 0;
+    }
+    else if (value == 0)
+    {
+        // Mỗi hạt mới nhận 1 sắc độ ngẫu nhiên, cố định suốt đời hạt
+        uint shade = Hash(id.x * 73856093u ^ id.y * 19349663u ^ (uint)Frame * 83492791u) % SHADES;
+        Current[index] = (uint)BrushType | (shade << 4);
+    }
+}
+
+[numthreads(8, 8, 1)]
+void Simulate(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x >= Width || (int)id.y >= Height)
+        return;
+
+    uint index = id.y * Width + id.x;
+    uint value = Current[index];
+
+    if ((value & 15u) == 0)
+        return;
+
+    int x = (int)id.x;
+    int y = (int)id.y;
+
+    int targetX = x;
+    int targetY = y;
+    bool moved = false;
+
+    if (y > 0)
+    {
+        uint below = (uint)(y - 1) * Width + x;
+        if (Current[below] == 0)
+        {
+            targetY = y - 1;
+            moved = true;
+        }
+
+        if (!moved)
+        {
+            bool leftFirst = ((x + y + Frame) & 1) == 0;
+            int firstDir  = leftFirst ? -1 :  1;
+            int secondDir = leftFirst ?  1 : -1;
+
+            int fx = x + firstDir;
+            if (fx >= 0 && fx < Width)
+            {
+                uint i = (uint)(y - 1) * Width + fx;
+                if (Current[i] == 0)
+                {
+                    targetX = fx;
+                    targetY = y - 1;
+                    moved = true;
+                }
+            }
+
+            if (!moved)
+            {
+                int sx = x + secondDir;
+                if (sx >= 0 && sx < Width)
+                {
+                    uint i = (uint)(y - 1) * Width + sx;
+                    if (Current[i] == 0)
+                    {
+                        targetX = sx;
+                        targetY = y - 1;
+                        moved = true;
+                    }
+                }
+            }
+        }
+    }
+
+    uint targetIndex = (uint)targetY * Width + targetX;
+    uint original;
+
+    InterlockedCompareExchange(Next[targetIndex], 0, value, original);
+
+    if (original != 0)
+    {
+        InterlockedCompareExchange(Next[index], 0, value, original);
+    }
+}
+
+[numthreads(8, 8, 1)]
+void Render(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x >= Width || (int)id.y >= Height)
+        return;
+
+    uint value = Current[id.y * Width + id.x];
+    uint type  = value & 15u;
+    uint shade = (value >> 4) & (SHADES - 1);
+
+    Result[id.xy] = Palette[type * SHADES + shade];
+}
+
+// Ô (x, y) của lane `lane` ở độ sâu d tính từ cạnh. Trả về false nếu nằm ngoài hồ.
+bool PortCell(int lane, int d, out int x, out int y)
+{
+    int l = (PortFlip != 0) ? (PortLanes - 1 - lane) : lane;
+    int a = PortOffset + l;
+
+    if (PortSide == 0)      { x = a;             y = d; }
+    else if (PortSide == 1) { x = a;             y = Height - 1 - d; }
+    else if (PortSide == 2) { x = d;             y = a; }
+    else                    { x = Width - 1 - d; y = a; }
+
+    return x >= 0 && x < Width && y >= 0 && y < Height;
+}
+
+// Mỗi lane lấy hạt gần cạnh nhất trong bề dày PortHeight, nhét vào ĐẦU ống.
+// Đầu ống đang có hạt thì không lấy (áp lực ngược).
+[numthreads(64, 1, 1)]
+void Extract(uint3 id : SV_DispatchThreadID)
+{
+    int lane = (int)id.x;
+    if (lane >= PortLanes)
+        return;
+
+    uint head = (uint)lane * (uint)PipeLength;
+    if (PipeBuf[head] != 0)
+        return;
+
+    for (int d = 0; d < PortHeight; d++)
+    {
+        int x, y;
+        if (!PortCell(lane, d, x, y))
+            break;
+
+        uint idx = (uint)y * Width + (uint)x;
+        uint v = Current[idx];
+        if (v != 0)
+        {
+            PipeBuf[head] = v;
+            Current[idx] = 0;
+            return;
+        }
+    }
+}
+
+// Thả hạt CUỐI ống vào ô sát cạnh. Ô đó đang có cát (hồ đầy) thì hạt ở lại trong ống.
+[numthreads(64, 1, 1)]
+void Inject(uint3 id : SV_DispatchThreadID)
+{
+    int lane = (int)id.x;
+    if (lane >= PortLanes)
+        return;
+
+    int x, y;
+    if (!PortCell(lane, 0, x, y))
+        return;
+
+    uint tail = (uint)lane * (uint)PipeLength + (uint)(PipeLength - 1);
+    uint v = PipeBuf[tail];
+    if (v == 0)
+        return;
+
+    uint idx = (uint)y * Width + (uint)x;
+    if (Current[idx] == 0)
+    {
+        Current[idx] = v;
+        PipeBuf[tail] = 0;
+    }
+}
