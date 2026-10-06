@@ -6,7 +6,6 @@ public class SandPalette : ScriptableObject
 {
     public const int Shades = 8;       // phải trùng #define SHADES trong compute shader
 
-    [Tooltip("Mỗi phần tử = 1 loại cát (tối đa 15)")]
     public SandColor[] types;
 
     public int TypeCount => types == null ? 0 : Mathf.Min(types.Length, 15);

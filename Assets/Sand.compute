@@ -5,6 +5,7 @@
 #pragma kernel Render
 #pragma kernel Extract
 #pragma kernel Inject
+#pragma kernel FillReceiver
 
 // Mỗi ô là 1 uint:  bit 0-3 = loại cát (0 = trống, 1..15)
 //                   bit 4-6 = sắc độ (shade 0..7) trong cùng 1 loại
@@ -34,6 +35,13 @@ int PortOffset;  // vị trí ô đầu tiên của cổng dọc theo cạnh
 int PortLanes;   // số ô của cổng = số lane của ống
 int PortFlip;    // 1 = đảo chiều lane so với chiều tăng dần dọc cạnh
 int PortHeight;  // bề dày (pixel) tầng được phép lấy, tính từ cạnh vào trong
+int PortAcceptType; // 0 = accept any, 1..15 = only accept this sand type (for Inject)
+int PortFilterType; // 0 = extract any, 1..15 = only extract this sand type (for Extract)
+RWStructuredBuffer<int> PortCounter; // [0] = count, [1] = capacity
+
+// ---- Receiver Fill by Percentage ----
+int TargetRow;
+uint FillType;
 
 uint Hash(uint x)
 {
@@ -216,6 +224,9 @@ void Extract(uint3 id : SV_DispatchThreadID)
         uint v = Current[idx];
         if (v != 0)
         {
+            if (PortFilterType > 0 && (int)(v & 0xFu) != PortFilterType)
+                return;
+
             PipeBuf[head] = v;
             Current[idx] = 0;
             return;
@@ -240,10 +251,43 @@ void Inject(uint3 id : SV_DispatchThreadID)
     if (v == 0)
         return;
 
+    // Filter by accepted sand type
+    if (PortAcceptType > 0 && (int)(v & 0xFu) != PortAcceptType)
+        return;
+
+    // Capacity limit check
+    int prevCount;
+    InterlockedAdd(PortCounter[0], 1, prevCount);
+    if (prevCount >= PortCounter[1])
+    {
+        InterlockedAdd(PortCounter[0], -1);
+        return;
+    }
+
     uint idx = (uint)y * Width + (uint)x;
     if (Current[idx] == 0)
     {
         Current[idx] = v;
-        PipeBuf[tail] = 0;
+    }
+    PipeBuf[tail] = 0;
+}
+
+[numthreads(8, 8, 1)]
+void FillReceiver(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x >= Width || (int)id.y >= Height)
+        return;
+
+    int y = (int)id.y;
+    uint index = (uint)y * Width + id.x;
+
+    if (y < TargetRow)
+    {
+        uint currentVal = Current[index];
+        if ((currentVal & 15u) != FillType)
+        {
+            uint shade = Hash(id.x * 73856093u ^ (uint)y * 19349663u) % SHADES;
+            Current[index] = (FillType & 15u) | (shade << 4);
+        }
     }
 }

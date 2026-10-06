@@ -13,22 +13,7 @@ public class GridObjectEditor : Editor
         GridObject gridObj = (GridObject)target;
 
         EditorGUILayout.Space(8);
-        EditorGUILayout.LabelField("Quick Actions", EditorStyles.boldLabel);
-
-        EditorGUILayout.BeginHorizontal();
-        if (GUILayout.Button("Snap To Nearest Cell"))
-        {
-            Undo.RecordObject(gridObj.transform, "Snap To Grid");
-            gridObj.SnapToNearestCell();
-            EditorUtility.SetDirty(gridObj);
-        }
-
-        if (GUILayout.Button("Update Collider"))
-        {
-            gridObj.ConfigureCollider();
-            EditorUtility.SetDirty(gridObj);
-        }
-        EditorGUILayout.EndHorizontal();
+        EditorGUILayout.LabelField("Quick Size", EditorStyles.boldLabel);
 
         EditorGUILayout.BeginHorizontal();
         if (GUILayout.Button("1 x 1"))
@@ -69,18 +54,12 @@ public class GridManagerEditor : Editor
         GridManager manager = (GridManager)target;
 
         EditorGUILayout.Space(8);
-        EditorGUILayout.LabelField("Grid Setup Tools", EditorStyles.boldLabel);
+        EditorGUILayout.LabelField("Grid Tools", EditorStyles.boldLabel);
 
-        if (GUILayout.Button("Auto-Fit Bounds from Background Tilemap"))
+        if (GUILayout.Button("Fit Bounds from Tilemap"))
         {
             Undo.RecordObject(manager, "Fit Tilemap Bounds");
             manager.RefreshBoundaries();
-            EditorUtility.SetDirty(manager);
-        }
-
-        if (GUILayout.Button("Snap & Register All Scene Objects"))
-        {
-            manager.RegisterAllSceneObjects();
             EditorUtility.SetDirty(manager);
         }
     }
