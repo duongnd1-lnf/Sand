@@ -193,7 +193,7 @@ public class GridRenderer : MonoBehaviour
         foreach (var config in levelData.objects)
         {
             GridObject prefab = GetPrefabByKey(config.key);
-            Vector3 spawnPos = gridManager.CellToWorldPosition(config.originCell);
+            Vector3 spawnPos = gridManager.CellToWorldPosition(config.originCell, prefab);
             GridObject instance = Instantiate(prefab, spawnPos, Quaternion.identity, parent);
             instance.ApplyRotation(config.rotation);
 
@@ -206,7 +206,7 @@ public class GridRenderer : MonoBehaviour
             GridObject prefab = GetPrefabByKey(sourceConfig.key);
             Vector2Int originCell = sourceConfig.GetOriginCell();
 
-            Vector3 spawnPos = gridManager.CellToWorldPosition(originCell, prefab.Size);
+            Vector3 spawnPos = gridManager.CellToWorldPosition(originCell, prefab);
             GridObject instance = Instantiate(prefab, spawnPos, Quaternion.identity, parent);
             instance.ApplyRotation(sourceConfig.rotation);
             instance.IsDraggable = sourceConfig.isDraggable;

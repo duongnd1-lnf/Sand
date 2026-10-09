@@ -4,8 +4,8 @@ using UnityEngine;
 /// <summary>
 /// Receiver component for sand containers on the grid.
 /// Accepts sand of a designated target color from an adjacent GridSandSource until capacity is reached.
+/// Pure data receiver: holds amount, capacity, and target color without internal sand simulation.
 /// </summary>
-[RequireComponent(typeof(GridObject))]
 public class GridSandReceiver : MonoBehaviour
 {
     [Header("Target & Capacity")]
@@ -24,6 +24,7 @@ public class GridSandReceiver : MonoBehaviour
     public SandColor TargetColor { get => _targetColor; set => _targetColor = value; }
     public int Capacity { get => _capacity; set => _capacity = value; }
     public int CurrentAmount { get => _currentAmount; set => _currentAmount = value; }
+    public float FillPercentage => Mathf.Clamp01((float)_currentAmount / Mathf.Max(1, _capacity));
     public bool IsFull => _currentAmount >= _capacity;
     public bool IsConnected => _connectedSource != null;
     public GridSandSource ConnectedSource => _connectedSource;
@@ -31,6 +32,10 @@ public class GridSandReceiver : MonoBehaviour
     private void Awake()
     {
         _gridObject = GetComponent<GridObject>();
+
+        // Ensure any SandFill child created previously is removed
+        Transform sandFill = transform.Find("SandFill");
+        if (sandFill != null) Destroy(sandFill.gameObject);
     }
 
     public bool CanConnect(GridSandSource source)

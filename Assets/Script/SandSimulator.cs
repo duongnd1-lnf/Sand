@@ -2,9 +2,9 @@ using UnityEngine;
 using UnityEngine.Rendering;
 
 /// <summary>
-/// Dynamic sand flow simulator (pipe/stream) connecting a SandSourcePool to a SandReceiverPool.
-/// Extracts sand from the source, advances particles forward in lanes, renders the flowing stream,
-/// and consumes particles at the tail into the receiver.
+/// Dynamic sand flow simulator (pipe/stream) connecting a SandPool to a SandReceiverPool.
+/// Extracts sand from the source, advances particles forward in lanes using Pipe.compute,
+/// renders the flowing stream, and consumes particles at the tail into the receiver.
 /// </summary>
 public class SandSimulator : MonoBehaviour
 {
@@ -16,7 +16,7 @@ public class SandSimulator : MonoBehaviour
     public Color emptyColor = new Color(0f, 0f, 0f, 0f);
 
     [Header("References")]
-    public SandSourcePool sourcePool;
+    public SandPool sourcePool;
     public SandReceiverPool receiverPool;
     public SandPool.Side sourceSide = SandPool.Side.Bottom;
     public int sourceOffset = 0;
@@ -41,7 +41,7 @@ public class SandSimulator : MonoBehaviour
     public bool IsInitialized => _isInitialized;
 
     public void Init(
-        SandSourcePool source,
+        SandPool source,
         SandReceiverPool receiver,
         SandPool.Side fromSide,
         int offA,

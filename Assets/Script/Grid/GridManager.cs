@@ -124,12 +124,11 @@ public class GridManager : MonoBehaviour
     }
 
     /// <summary>
-    /// Returns the world center of the pivot cell for a GridObject placed at originCell.
-    /// Since the pivot offset is always (0,0), this is just the center of originCell itself.
+    /// Calculates the world position center for a GridObject placed at originCell based on its shape type.
     /// </summary>
     public Vector3 CellToWorldPosition(Vector2Int originCell, GridObject obj)
     {
-        return CellToWorldPosition(originCell);
+        return obj.GetWorldPosition(this, originCell);
     }
 
     /// <summary>
@@ -163,12 +162,11 @@ public class GridManager : MonoBehaviour
     }
 
     /// <summary>
-    /// Converts the world position of a GridObject's pivot into its origin (pivot) cell.
-    /// Since transform.position IS the pivot cell center, we just do a single-cell lookup.
+    /// Converts a world coordinate of a GridObject into its origin cell based on its shape type.
     /// </summary>
     public Vector2Int WorldToCellPosition(Vector3 worldPos, GridObject obj)
     {
-        return WorldToCellPosition(worldPos);
+        return obj.WorldToOriginCell(this, worldPos);
     }
 
     /// <summary>
