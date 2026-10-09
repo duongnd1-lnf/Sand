@@ -8,6 +8,7 @@
 #pragma kernel FillReceiver
 #pragma kernel Drain
 #pragma kernel ClearType
+#pragma kernel ProbeSand
 
 // Mỗi ô là 1 uint:  bit 0-3 = loại cát (0 = trống, 1..15)
 //                   bit 4-6 = sắc độ (shade 0..7) trong cùng 1 loại
@@ -49,6 +50,14 @@ uint FillType;
 int DrainType;
 int ClearTargetType;
 RWStructuredBuffer<int> DrainCounter;
+
+// ---- Probe Sand in Rect / Cell ----
+int ProbeXMin;
+int ProbeXMax;
+int ProbeYMin;
+int ProbeYMax;
+int ProbeTargetType;
+RWStructuredBuffer<int> ProbeCounter;
 
 uint Hash(uint x)
 {
@@ -348,5 +357,25 @@ void ClearType(uint3 id : SV_DispatchThreadID)
     {
         Current[idx] = 0;
         Next[idx] = 0;
+    }
+}
+
+[numthreads(8, 8, 1)]
+void ProbeSand(uint3 id : SV_DispatchThreadID)
+{
+    int x = ProbeXMin + (int)id.x;
+    int y = ProbeYMin + (int)id.y;
+
+    if (x >= ProbeXMax || y >= ProbeYMax || x >= Width || y >= Height)
+        return;
+
+    uint v = Current[(uint)y * Width + (uint)x];
+    if (v != 0)
+    {
+        int t = (int)(v & 15u);
+        if (ProbeTargetType <= 0 || t == ProbeTargetType)
+        {
+            InterlockedAdd(ProbeCounter[0], 1);
+        }
     }
 }

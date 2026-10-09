@@ -10,8 +10,11 @@ public class GridSandSourceVisual : SandPool
 {
     private int _kDrain = -1;
     private int _kClearType = -1;
+    private int _kProbeSand = -1;
     private ComputeBuffer _drainCounterBuffer;
+    private ComputeBuffer _probeCounterBuffer;
     private readonly int[] _drainCounterData = new int[2];
+    private readonly int[] _probeCounterData = new int[1];
 
     private readonly Dictionary<Vector2Int, ParticleSystem> _cellToParticles = new Dictionary<Vector2Int, ParticleSystem>();
     private static Texture2D _circleTex;
@@ -83,8 +86,11 @@ public class GridSandSourceVisual : SandPool
     {
         _kDrain = shader.FindKernel("Drain");
         _kClearType = shader.FindKernel("ClearType");
+        _kProbeSand = shader.FindKernel("ProbeSand");
         _drainCounterBuffer?.Release();
         _drainCounterBuffer = new ComputeBuffer(2, sizeof(int));
+        _probeCounterBuffer?.Release();
+        _probeCounterBuffer = new ComputeBuffer(1, sizeof(int));
 
         if (_source != null && _source.Layers != null && _source.Layers.Count > 0)
         {
@@ -219,6 +225,55 @@ public class GridSandSourceVisual : SandPool
             Step();
         }
         RenderTextureUpdate();
+    }
+
+    public int GetTypeId(SandColor color)
+    {
+        if (color == null || palette == null || palette.types == null) return 0;
+        for (int i = 0; i < palette.TypeCount; i++)
+        {
+            if (palette.types[i] == color) return i + 1;
+        }
+        return 0;
+    }
+
+    public int CountSandInCell(Vector2Int sourceCell, int targetTypeId, GridObject gridObj)
+    {
+        if (current == null || targetTypeId <= 0 || shader == null) return 0;
+        if (_kProbeSand < 0) _kProbeSand = shader.FindKernel("ProbeSand");
+        if (_probeCounterBuffer == null) _probeCounterBuffer = new ComputeBuffer(1, sizeof(int));
+
+        int objSizeX = gridObj != null ? Mathf.Max(1, gridObj.Size.x) : 1;
+        int objSizeY = gridObj != null ? Mathf.Max(1, gridObj.Size.y) : 1;
+        Vector2Int localCell = gridObj != null ? sourceCell - gridObj.GridPosition : Vector2Int.zero;
+
+        int xMin = Mathf.Clamp(localCell.x * width / objSizeX, 0, width - 1);
+        int xMax = Mathf.Clamp((localCell.x + 1) * width / objSizeX, 0, width);
+        int yMin = Mathf.Clamp(localCell.y * height / objSizeY, 0, height - 1);
+        int yMax = Mathf.Clamp((localCell.y + 1) * height / objSizeY, 0, height);
+
+        _probeCounterData[0] = 0;
+        _probeCounterBuffer.SetData(_probeCounterData);
+
+        shader.SetInt("ProbeXMin", xMin);
+        shader.SetInt("ProbeXMax", xMax);
+        shader.SetInt("ProbeYMin", yMin);
+        shader.SetInt("ProbeYMax", yMax);
+        shader.SetInt("ProbeTargetType", targetTypeId);
+        shader.SetBuffer(_kProbeSand, "Current", current);
+        shader.SetBuffer(_kProbeSand, "ProbeCounter", _probeCounterBuffer);
+
+        int countX = Mathf.CeilToInt((xMax - xMin) / 8f);
+        int countY = Mathf.CeilToInt((yMax - yMin) / 8f);
+        shader.Dispatch(_kProbeSand, Mathf.Max(1, countX), Mathf.Max(1, countY), 1);
+
+        _probeCounterBuffer.GetData(_probeCounterData);
+        return _probeCounterData[0];
+    }
+
+    public bool HasSandInCell(Vector2Int sourceCell, int targetTypeId, GridObject gridObj, int minThreshold = 5)
+    {
+        return CountSandInCell(sourceCell, targetTypeId, gridObj) >= minThreshold;
     }
 
     private void GetPortParameters(Vector2Int sourceCell, GridSandReceiver receiver, GridObject gridObj, out Side side, out int offset, out int lanes)
@@ -459,6 +514,7 @@ public class GridSandSourceVisual : SandPool
     {
         DestroyAllStreams();
         _drainCounterBuffer?.Release();
+        _probeCounterBuffer?.Release();
         base.OnDestroy();
         if (shader != null) Destroy(shader);
     }

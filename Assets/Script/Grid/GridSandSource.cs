@@ -104,13 +104,10 @@ public class GridSandSource : MonoBehaviour
 
     public void ProcessTransfer(float deltaTime)
     {
-        if (!HasContent || !HasActiveConnections) return;
+        if (!HasActiveConnections) return;
 
         SandLayer currentLayer = CurrentLayer;
-        if (currentLayer == null || currentLayer.amount <= 0) return;
-
-        int resolvedType = currentLayer.typeId;
-        float pixelsPerUnit = currentLayer.initialAmount > 0
+        float pixelsPerUnit = currentLayer != null && currentLayer.initialAmount > 0
             ? (float)currentLayer.initialPixels / currentLayer.initialAmount
             : (_visual.width * _visual.height / 100f);
 
@@ -123,18 +120,30 @@ public class GridSandSource : MonoBehaviour
         var connections = new List<KeyValuePair<Vector2Int, GridSandReceiver>>(_cellToReceiver);
         for (int i = 0; i < connections.Count; i++)
         {
-            if (currentLayer.amount <= 0) break;
-
             Vector2Int cell = connections[i].Key;
             GridSandReceiver receiver = connections[i].Value;
             if (receiver == null || !receiver.IsConnected || receiver.IsFull) continue;
 
+            int targetTypeId = _visual.GetTypeId(receiver.TargetColor);
+            if (targetTypeId <= 0) continue;
+
+            SandLayer targetLayer = FindLayerByColor(receiver.TargetColor);
+
             // 1. Cát phải rút trước! Rút từ lỗ đáy và đếm số lượng hạt thực tế bị xóa khỏi hồ
-            int actuallyDrained = _visual.DrainHole(cell, receiver, frameBudget, resolvedType, _gridObject);
-            if (actuallyDrained <= 0) continue;
+            int actuallyDrained = _visual.DrainHole(cell, receiver, frameBudget, targetTypeId, _gridObject);
+            if (actuallyDrained <= 0)
+            {
+                // Kiểm tra xem tại ô này còn hạt cát nào màu này không
+                if (!_visual.HasSandInCell(cell, targetTypeId, _gridObject, 1))
+                {
+                    Disconnect(receiver);
+                    receiver.Disconnect();
+                }
+                continue;
+            }
 
             // 2. Tạo hạt particle tương ứng với số cát thực tế đã rút bay vào receiver
-            _visual.EmitStreamParticles(cell, receiver, actuallyDrained, CurrentColor);
+            _visual.EmitStreamParticles(cell, receiver, actuallyDrained, receiver.TargetColor);
 
             // 3. Cập nhật amount cho receiver và source tương ứng số cát đã rút
             _drainedPixelAccumulator += actuallyDrained;
@@ -145,51 +154,60 @@ public class GridSandSource : MonoBehaviour
                 _drainedPixelAccumulator -= amountToAdd * pixelsPerUnit;
                 int space = receiver.Capacity - receiver.CurrentAmount;
                 int transferAmount = Mathf.Min(amountToAdd, space);
-                transferAmount = Mathf.Min(transferAmount, currentLayer.amount);
+                if (targetLayer != null)
+                {
+                    transferAmount = Mathf.Min(transferAmount, targetLayer.amount);
+                    targetLayer.amount -= transferAmount;
+                    if (targetLayer.amount <= 0)
+                    {
+                        PurgeLayerAndAdvance(targetLayer, targetTypeId);
+                    }
+                }
 
                 if (transferAmount > 0)
                 {
                     receiver.AddAmount(transferAmount);
-                    currentLayer.amount -= transferAmount;
                 }
             }
         }
-
-        if (currentLayer.amount <= 0)
-        {
-            PurgeCurrentLayerAndAdvance(resolvedType);
-        }
     }
 
-    private void PurgeCurrentLayerAndAdvance(int resolvedType)
+    private void PurgeLayerAndAdvance(SandLayer layer, int resolvedType)
     {
         _visual.PurgeLayer(resolvedType);
-
-        _frameBudgetAccumulator = 0f;
-        _drainedPixelAccumulator = 0f;
-
-        if (_layers.Count > 0)
-        {
-            _layers.RemoveAt(0);
-        }
+        _layers.Remove(layer);
 
         if (_layers.Count == 0)
         {
             _visual.ClearAll();
             DisconnectAll();
-            return;
         }
+    }
 
-        var receivers = new List<GridSandReceiver>(_receiverToCell.Keys);
-        for (int i = 0; i < receivers.Count; i++)
+    public void PurgeCurrentLayerAndAdvance(int resolvedType)
+    {
+        if (CurrentLayer != null)
         {
-            GridSandReceiver r = receivers[i];
-            if (r.TargetColor != CurrentColor)
-            {
-                Disconnect(r);
-                r.Disconnect();
-            }
+            PurgeLayerAndAdvance(CurrentLayer, resolvedType);
         }
+    }
+
+    public SandLayer FindLayerByColor(SandColor color)
+    {
+        for (int i = 0; i < _layers.Count; i++)
+        {
+            if (_layers[i].color == color) return _layers[i];
+        }
+        return null;
+    }
+
+    public bool HasRealSandFor(Vector2Int sourceCell, GridSandReceiver receiver)
+    {
+        if (_visual == null || !_visual.Ready) return false;
+        int targetTypeId = _visual.GetTypeId(receiver.TargetColor);
+        if (targetTypeId <= 0) return false;
+
+        return _visual.HasSandInCell(sourceCell, targetTypeId, _gridObject);
     }
 
     public bool IsCellConnected(Vector2Int sourceCell) => _cellToReceiver.ContainsKey(sourceCell);
@@ -198,10 +216,15 @@ public class GridSandSource : MonoBehaviour
     public bool CanConnect(GridSandReceiver receiver)
     {
         if (receiver.IsConnected || receiver.IsFull) return false;
-        if (!HasContent) return false;
-        if (receiver.TargetColor != CurrentColor) return false;
+        int targetTypeId = _visual.GetTypeId(receiver.TargetColor);
+        return targetTypeId > 0 && FindLayerByColor(receiver.TargetColor) != null;
+    }
 
-        return true;
+    public bool CanConnect(Vector2Int sourceCell, GridSandReceiver receiver)
+    {
+        if (!CanConnect(receiver)) return false;
+        if (IsCellConnected(sourceCell)) return false;
+        return HasRealSandFor(sourceCell, receiver);
     }
 
     public void Connect(Vector2Int sourceCell, GridSandReceiver receiver)

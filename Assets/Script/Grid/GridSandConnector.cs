@@ -72,7 +72,7 @@ public class GridSandConnector : MonoBehaviour
     }
 
     /// <summary>
-    /// Validates existing connections and breaks them if out of range, full, empty, or mismatched color.
+    /// Validates existing connections and breaks them if out of range, full, empty, or no sand left in simulation.
     /// </summary>
     public void EvaluateActiveConnections()
     {
@@ -91,9 +91,9 @@ public class GridSandConnector : MonoBehaviour
                 GridSandReceiver receiver = activePairs[i].Value;
 
                 bool shouldDisconnect = receiver.IsFull
-                                     || !source.HasContent
-                                     || source.CurrentColor != receiver.TargetColor
-                                     || GetMinDistance(source, sourceCell, receiver) > maxAllowedDist;
+                                     || !source.CanConnect(receiver)
+                                     || GetMinDistance(source, sourceCell, receiver) > maxAllowedDist
+                                     || !source.HasRealSandFor(sourceCell, receiver);
 
                 if (shouldDisconnect)
                 {
@@ -105,7 +105,7 @@ public class GridSandConnector : MonoBehaviour
     }
 
     /// <summary>
-    /// Searches for matching sources within _connectionRange around unconnected receivers and connects the closest one.
+    /// Searches for matching sources with real sand in simulation within _connectionRange around unconnected receivers and connects the closest one.
     /// </summary>
     public void EvaluatePendingConnections()
     {
@@ -125,7 +125,7 @@ public class GridSandConnector : MonoBehaviour
             for (int s = 0; s < sources.Length; s++)
             {
                 GridSandSource source = sources[s];
-                if (!source.HasContent || source.CurrentColor != receiver.TargetColor) continue;
+                if (!source.CanConnect(receiver)) continue;
 
                 Vector2Int origin = source.GridObject.GridPosition;
                 foreach (var offset in source.GridObject.OccupiedOffsets)
@@ -136,6 +136,8 @@ public class GridSandConnector : MonoBehaviour
                     float dist = GetMinDistance(source, sourceCell, receiver);
                     if (dist <= minDistance)
                     {
+                        if (!source.HasRealSandFor(sourceCell, receiver)) continue;
+
                         minDistance = dist;
                         bestSource = source;
                         bestSourceCell = sourceCell;

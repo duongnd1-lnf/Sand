@@ -41,10 +41,7 @@ public class GridSandReceiver : MonoBehaviour
     public bool CanConnect(GridSandSource source)
     {
         if (IsConnected || IsFull || source.IsConnectedTo(this)) return false;
-        if (!source.HasContent) return false;
-        if (_targetColor != source.CurrentColor) return false;
-
-        return true;
+        return source.CanConnect(this);
     }
 
     public void Connect(GridSandSource source)

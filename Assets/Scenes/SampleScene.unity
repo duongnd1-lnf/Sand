@@ -824,6 +824,9 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: fdfd695b0d1a1a34c9ba9d3c2f6e5e49, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
+  _connectionRange: 0.74
+  _disconnectBuffer: 0.35
+  _continuousEvaluation: 1
   _autoConnectOnPlaced: 1
 --- !u!1 &443434725
 GameObject:
