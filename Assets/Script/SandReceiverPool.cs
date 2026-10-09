@@ -1,17 +1,16 @@
 using System;
 using UnityEngine;
-using UnityEngine.Events;
-using UnityEngine.Rendering;
 
 /// <summary>
 /// Receiver sand pool:
 /// - Initialized empty.
+/// - Does not require internal sand simulation resolution.
 /// - Strictly accepts only 1 specific color type (acceptedColor or acceptedSandType).
 /// - Has a configurable capacity (e.g. 1000 particles).
 /// - Automatically covers/fills up proportional to the percentage of sand received (0% -> 100%).
 /// - Halts receiving when full (100%) and fires the onPoolFull event.
 /// </summary>
-public class SandReceiverPool : SandPool
+public class SandReceiverPool : MonoBehaviour
 {
     [Header("Accepted Color (Single Color Filter)")]
     public SandColor acceptedColor;
@@ -23,25 +22,62 @@ public class SandReceiverPool : SandPool
 
     [SerializeField] private int _receivedCount = 0;
 
-    [Header("Receiver Physics")]
-    public bool simulatePhysics = true;
+    [Header("Rendering")]
+    public MeshRenderer target;
+    public SandPalette palette;
+    public Color emptyColor = new Color(0f, 0f, 0f, 0f);
 
-    [Header("Events")]
-    public UnityEvent onPoolFull;
+    // Events (Standard C# Action events)
+    public event Action onPoolFull;
+    public event Action<float> onFillChanged;
 
     public int ReceivedCount => _receivedCount;
     public float FillPercentage => Mathf.Clamp01((float)_receivedCount / Mathf.Max(1, capacity));
     public bool IsFull => _receivedCount >= capacity;
+    public int Capacity => capacity;
+    public bool Ready => true;
 
-    private ComputeBuffer _counterBuffer;
-    private int _kFillReceiver = -1;
-    private bool _readbackPending = false;
-    private int[] _counterData = new int[2];
-    private int _lastFilledRow = 0;
+    private Texture2D _fillTexture;
     private bool _fullEventFired = false;
+    private const int TextureWidth = 32;
+    private const int TextureHeight = 64;
+
+    private void Awake()
+    {
+        if (target == null)
+        {
+            target = GetComponentInChildren<MeshRenderer>();
+        }
+    }
+
+    private void Start()
+    {
+        InitVisual();
+    }
+
+    private void InitVisual()
+    {
+        if (target == null) return;
+
+        if (_fillTexture == null)
+        {
+            _fillTexture = new Texture2D(TextureWidth, TextureHeight, TextureFormat.RGBA32, false);
+            _fillTexture.filterMode = FilterMode.Point;
+            _fillTexture.wrapMode = TextureWrapMode.Clamp;
+        }
+
+        Material mat = target.material;
+        if (mat != null)
+        {
+            if (mat.HasProperty("_BaseMap")) mat.SetTexture("_BaseMap", _fillTexture);
+            if (mat.HasProperty("_MainTex")) mat.SetTexture("_MainTex", _fillTexture);
+        }
+
+        UpdateFillVisual();
+    }
 
     /// <summary>
-    /// Returns the resolved sand type ID (1..15) accepted by this pool.
+    /// Returns the resolved sand type ID (1..15) accepted by this receiver.
     /// </summary>
     public int GetAcceptedType()
     {
@@ -58,150 +94,119 @@ public class SandReceiverPool : SandPool
     /// </summary>
     public bool AcceptsSandType(int type)
     {
-        return type == GetAcceptedType();
-    }
-
-    protected override void OnPoolInitialized()
-    {
-        _kFillReceiver = shader.FindKernel("FillReceiver");
-        EnsureCounterBuffer();
-        ResetPool();
-    }
-
-    private void EnsureCounterBuffer()
-    {
-        if (_counterBuffer == null)
-        {
-            _counterBuffer = new ComputeBuffer(2, sizeof(int));
-            _counterBuffer.SetData(new int[] { _receivedCount, Mathf.Max(1, capacity) });
-        }
+        return type == 0 || type == GetAcceptedType();
     }
 
     /// <summary>
-    /// Injects sand into this receiver.
-    /// Rejects particles if already full or if color does not match accepted type.
+    /// Gets the base color representing this receiver's accepted sand.
     /// </summary>
-    public override void Inject(ComputeBuffer pipe, int pipeLength, int lanes, Side side, int offset, bool flip, int acceptType = 0)
+    public Color GetVisualColor()
     {
-        if (IsFull) return;
+        if (acceptedColor != null)
+        {
+            return acceptedColor.Get(0);
+        }
 
-        EnsureCounterBuffer();
-        shader.SetBuffer(kInject, "PortCounter", _counterBuffer);
-        base.Inject(pipe, pipeLength, lanes, side, offset, flip, GetAcceptedType());
+        int type = GetAcceptedType();
+        if (palette != null && palette.types != null && type >= 1 && type <= palette.TypeCount)
+        {
+            SandColor col = palette.types[type - 1];
+            if (col != null) return col.Get(0);
+        }
+
+        return Color.white;
     }
 
-    void Update()
+    /// <summary>
+    /// Receives sand particles into this receiver.
+    /// Returns the number of particles actually accepted.
+    /// </summary>
+    public int ReceiveSand(int amount, int sandType = 0)
     {
-        if (current == null) return;
+        if (amount <= 0 || IsFull) return 0;
+        if (sandType != 0 && !AcceptsSandType(sandType)) return 0;
 
-        SyncCounterFromGPU();
+        int remaining = capacity - _receivedCount;
+        int accepted = Mathf.Min(amount, remaining);
+        _receivedCount += accepted;
+
         UpdateFillVisual();
-
-        if (simulatePhysics)
-        {
-            for (int i = 0; i < stepsPerFrame; i++)
-                Step();
-        }
-
-        RenderTextureUpdate();
-    }
-
-    private void SyncCounterFromGPU()
-    {
-        if (_counterBuffer == null) return;
-
-        if (SystemInfo.supportsAsyncGPUReadback)
-        {
-            if (!_readbackPending)
-            {
-                _readbackPending = true;
-                AsyncGPUReadback.Request(_counterBuffer, OnReadbackComplete);
-            }
-        }
-        else
-        {
-            _counterBuffer.GetData(_counterData);
-            ApplyReceivedCount(_counterData[0]);
-        }
-    }
-
-    private void OnReadbackComplete(AsyncGPUReadbackRequest req)
-    {
-        _readbackPending = false;
-        if (!req.hasError && _counterBuffer != null)
-        {
-            var data = req.GetData<int>();
-            ApplyReceivedCount(data[0]);
-        }
-    }
-
-    private void ApplyReceivedCount(int count)
-    {
-        int clamped = Mathf.Clamp(count, 0, capacity);
-        if (clamped != _receivedCount)
-        {
-            _receivedCount = clamped;
-        }
+        onFillChanged?.Invoke(FillPercentage);
 
         if (IsFull && !_fullEventFired)
         {
             _fullEventFired = true;
             onPoolFull?.Invoke();
         }
+
+        return accepted;
     }
 
     /// <summary>
-    /// Updates the sand buffer to automatically cover the pool proportional to FillPercentage.
+    /// Updates the sand fill texture proportional to FillPercentage.
     /// </summary>
-    private void UpdateFillVisual()
+    public void UpdateFillVisual()
     {
-        if (_kFillReceiver < 0) return;
+        if (target == null) return;
+        if (_fillTexture == null)
+        {
+            InitVisual();
+            if (_fillTexture == null) return;
+        }
 
         float p = FillPercentage;
-        int targetRow = p >= 1f ? height : Mathf.FloorToInt(p * height);
+        int targetRow = p >= 1f ? TextureHeight : Mathf.RoundToInt(p * TextureHeight);
         if (p > 0f && targetRow == 0) targetRow = 1;
-        targetRow = Mathf.Min(targetRow, height);
+        targetRow = Mathf.Min(targetRow, TextureHeight);
 
-        if (targetRow > _lastFilledRow)
+        Color[] pixels = new Color[TextureWidth * TextureHeight];
+        Color baseCol = GetVisualColor();
+
+        for (int y = 0; y < TextureHeight; y++)
         {
-            shader.SetInt("TargetRow", targetRow);
-            shader.SetInt("FillType", GetAcceptedType());
-            shader.SetBuffer(_kFillReceiver, "Current", current);
-            shader.Dispatch(_kFillReceiver, gx, gy, 1);
-            _lastFilledRow = targetRow;
+            for (int x = 0; x < TextureWidth; x++)
+            {
+                if (y < targetRow)
+                {
+                    // Subtle grain shading pattern
+                    int shade = (x * 7 + y * 13) % 8;
+                    float factor = 0.88f + shade * 0.035f;
+                    pixels[y * TextureWidth + x] = new Color(
+                        Mathf.Clamp01(baseCol.r * factor),
+                        Mathf.Clamp01(baseCol.g * factor),
+                        Mathf.Clamp01(baseCol.b * factor),
+                        1f
+                    );
+                }
+                else
+                {
+                    pixels[y * TextureWidth + x] = emptyColor;
+                }
+            }
         }
+
+        _fillTexture.SetPixels(pixels);
+        _fillTexture.Apply();
     }
 
     /// <summary>
-    /// Resets the receiver pool to completely empty.
+    /// Resets the receiver to completely empty.
     /// </summary>
     [ContextMenu("Reset Receiver")]
     public void ResetPool()
     {
         _receivedCount = 0;
-        _lastFilledRow = 0;
         _fullEventFired = false;
-        if (_counterBuffer != null)
-        {
-            _counterBuffer.SetData(new int[] { 0, Mathf.Max(1, capacity) });
-        }
-        ClearAll();
-        RenderTextureUpdate();
+        UpdateFillVisual();
+        onFillChanged?.Invoke(0f);
     }
 
-#if UNITY_EDITOR
-    void OnValidate()
+    private void OnDestroy()
     {
-        if (Application.isPlaying && _counterBuffer != null)
+        if (_fillTexture != null)
         {
-            _counterBuffer.SetData(new int[] { _receivedCount, Mathf.Max(1, capacity) });
+            Destroy(_fillTexture);
+            _fillTexture = null;
         }
-    }
-#endif
-
-    protected override void OnDestroy()
-    {
-        base.OnDestroy();
-        _counterBuffer?.Release();
     }
 }

@@ -5,7 +5,8 @@ using UnityEngine;
 /// <summary>
 /// Source sand pool: Initialized full of sand with stacked color layers.
 /// Multiple output directions can be selected (allowedFromSides).
-/// Target connection is controlled externally by another controller.
+/// When connected to a receiver, it creates a SandSimulator quad that visually
+/// streams sand from the source into the nearest connected cell of the receiver.
 /// </summary>
 public class SandSourcePool : SandPool
 {
@@ -39,16 +40,34 @@ public class SandSourcePool : SandPool
     [Range(1, 64)] public int transferLanes = 16;
     [Range(1, 10)] public int transferSpeed = 2;
 
+    [Header("Sand Simulator (Flow Stream)")]
+    public ComputeShader pipeShader;
+    public Material pipeMaterial;
+    public Color streamEmptyColor = new Color(0f, 0f, 0f, 0f);
+    public float sourceEmbed = 0.08f;
+
+    private SandSimulator _activeSimulator;
+
     public SandReceiverPool ActiveReceiver => _activeReceiver;
     public Side ActiveFromSide => _activeFromSide;
     public Side ActiveToSide => _activeToSide;
     public bool IsTransferring { get => _isTransferring; set => _isTransferring = value; }
-
-    ComputeBuffer transferBuffer;
+    public SandSimulator ActiveSimulator => _activeSimulator;
 
     protected override void OnPoolInitialized()
     {
+        EnsureShaderReference();
         InitializeFullSand();
+    }
+
+    private void EnsureShaderReference()
+    {
+        if (pipeShader == null)
+        {
+#if UNITY_EDITOR
+            pipeShader = UnityEditor.AssetDatabase.LoadAssetAtPath<ComputeShader>("Assets/Pipe.compute");
+#endif
+        }
     }
 
     /// <summary>
@@ -61,9 +80,20 @@ public class SandSourcePool : SandPool
 
     /// <summary>
     /// External API to connect this pool to a receiver on specified sides.
-    /// Returns true if fromSide is allowed and connection is established.
     /// </summary>
     public bool Connect(SandReceiverPool receiver, Side from, Side to)
+    {
+        GridObject sourceObj = GetComponent<GridObject>();
+        GridObject receiverObj = receiver != null ? receiver.GetComponent<GridObject>() : null;
+        Vector2Int sPos = sourceObj != null ? sourceObj.GridPosition : Vector2Int.zero;
+        Vector2Int rPos = receiverObj != null ? receiverObj.GridPosition : Vector2Int.zero;
+        return Connect(receiver, from, to, sPos, rPos);
+    }
+
+    /// <summary>
+    /// Connects to a receiver and creates a SandSimulator flowing into nearestReceiverCell.
+    /// </summary>
+    public bool Connect(SandReceiverPool receiver, Side from, Side to, Vector2Int sourceCell, Vector2Int receiverCell)
     {
         if (receiver == null)
         {
@@ -77,18 +107,148 @@ public class SandSourcePool : SandPool
             return false;
         }
 
+        Disconnect();
+
         _activeReceiver = receiver;
         _activeFromSide = from;
         _activeToSide = to;
         _isTransferring = true;
+
+        CreateSimulator(receiver, from, to, sourceCell, receiverCell);
         return true;
     }
 
+    private void CreateSimulator(SandReceiverPool receiver, Side from, Side to, Vector2Int sourceCell, Vector2Int receiverCell)
+    {
+        EnsureShaderReference();
+
+        if (pipeShader == null)
+        {
+            Debug.LogError("[SandSourcePool] pipeShader (Pipe.compute) is missing! Cannot create SandSimulator.", this);
+            return;
+        }
+
+        GridObject sourceObj = GetComponent<GridObject>();
+        GridManager gridManager = sourceObj != null ? sourceObj.Manager : null;
+
+        // 1) Compute normalized edge position t
+        float t = 0.5f;
+        if (sourceObj != null)
+        {
+            if (from == Side.Bottom || from == Side.Top)
+            {
+                t = (sourceCell.x - sourceObj.GridPosition.x + 0.5f) / Mathf.Max(1, sourceObj.Size.x);
+            }
+            else
+            {
+                t = (sourceCell.y - sourceObj.GridPosition.y + 0.5f) / Mathf.Max(1, sourceObj.Size.y);
+            }
+            t = Mathf.Clamp01(t);
+        }
+
+        int cellsA = EdgeCells(from);
+        int n = Mathf.Max(1, Mathf.Min(transferLanes, cellsA));
+        int offA = EdgeOffset(from, t, n);
+
+        GetContact(from, t, out Vector3 edgePt, out Vector3 outward, out Vector3 along);
+        Vector3 startPt = edgePt - outward * sourceEmbed;
+
+        // 2) Determine destination position inside nearestReceiverCell
+        Vector3 receiverCellCenter;
+        if (gridManager != null)
+        {
+            receiverCellCenter = gridManager.CellToWorldPosition(receiverCell, Vector2Int.one);
+        }
+        else
+        {
+            receiverCellCenter = receiver.transform.position;
+        }
+
+        Vector3 endPt = receiverCellCenter;
+
+        Vector3 fwd = target != null ? target.transform.forward : Vector3.forward;
+        Vector3 d = Vector3.ProjectOnPlane(endPt - startPt, fwd);
+        float dist = d.magnitude;
+
+        if (dist < 0.01f)
+        {
+            dist = 0.1f;
+            d = outward * dist;
+        }
+
+        Vector3 dir = d.normalized;
+        Vector3 perp = Vector3.Cross(fwd, dir);
+        bool flipA = Vector3.Dot(perp, along) < 0f;
+
+        float cellWorldSize = CellWorldSize(from);
+        int streamLength = Mathf.Max(4, Mathf.RoundToInt(dist / Mathf.Max(1e-5f, cellWorldSize)));
+
+        // 3) Create Quad GameObject
+        GameObject go = GameObject.CreatePrimitive(PrimitiveType.Quad);
+        go.name = "SandSimulator";
+        Collider col = go.GetComponent<Collider>();
+        if (col != null) Destroy(col);
+
+        Vector3 center = startPt + d * 0.5f;
+        Quaternion rot = Quaternion.LookRotation(fwd, perp);
+        Vector3 scale = new Vector3(dist, n * cellWorldSize, 1f);
+
+        go.transform.SetPositionAndRotation(center, rot);
+        go.transform.localScale = scale;
+        go.transform.SetParent(transform, true);
+
+        MeshRenderer mr = go.GetComponent<MeshRenderer>();
+        if (pipeMaterial != null)
+        {
+            mr.material = new Material(pipeMaterial);
+        }
+        else
+        {
+            Shader spriteShader = Shader.Find("Universal Render Pipeline/2D/Sprite-Unlit") ?? Shader.Find("Sprites/Default");
+            if (spriteShader != null)
+            {
+                mr.material = new Material(spriteShader);
+            }
+            else if (target != null && target.sharedMaterial != null)
+            {
+                mr.material = new Material(target.sharedMaterial);
+            }
+        }
+
+        if (target != null)
+        {
+            mr.sortingLayerID = target.sortingLayerID;
+            mr.sortingOrder = target.sortingOrder + 1;
+        }
+
+        _activeSimulator = go.AddComponent<SandSimulator>();
+        _activeSimulator.Init(
+            source: this,
+            receiver: receiver,
+            fromSide: from,
+            offA: offA,
+            flipA: flipA,
+            streamLength: streamLength,
+            streamLanes: n,
+            transferSpeed: transferSpeed,
+            computeShader: pipeShader,
+            sandPalette: palette,
+            meshRenderer: mr,
+            backgroundEmptyColor: streamEmptyColor
+        );
+    }
+
     /// <summary>
-    /// External API to disconnect the active receiver.
+    /// External API to disconnect the active receiver and destroy the simulator.
     /// </summary>
     public void Disconnect()
     {
+        if (_activeSimulator != null)
+        {
+            Destroy(_activeSimulator.gameObject);
+            _activeSimulator = null;
+        }
+
         _activeReceiver = null;
         _isTransferring = false;
     }
@@ -198,42 +358,15 @@ public class SandSourcePool : SandPool
     {
         if (current == null) return;
 
-        // Sand transfer active
-        if (_isTransferring && _activeReceiver != null && _activeReceiver.Ready)
+        if (_isTransferring)
         {
-            if (_activeReceiver.IsFull)
-            {
-                _isTransferring = false;
-                return;
-            }
-
-            EnsureTransferBuffer();
-
-            int cellsA = EdgeCells(_activeFromSide);
-            int cellsB = _activeReceiver.EdgeCells(_activeToSide);
-            int n = Mathf.Max(1, Mathf.Min(transferLanes, Mathf.Min(cellsA, cellsB)));
-
-            int offA = EdgeOffset(_activeFromSide, 0.5f, n);
-            int offB = _activeReceiver.EdgeOffset(_activeToSide, 0.5f, n);
-            int targetType = _activeReceiver.GetAcceptedType();
-
-            for (int i = 0; i < transferSpeed; i++)
-            {
-                Extract(transferBuffer, 1, n, _activeFromSide, offA, false, 4, filterType: targetType);
-                _activeReceiver.Inject(transferBuffer, 1, n, _activeToSide, offB, false, acceptType: targetType);
-            }
-
-            // Step both pools so sand sinks in source and stacks up in receiver
-            Step();
-            _activeReceiver.Step();
-
-            if (_activeReceiver.IsFull)
+            if (_activeReceiver == null || _activeReceiver.IsFull)
             {
                 _isTransferring = false;
             }
         }
 
-        if (simulatePhysics)
+        if (simulatePhysics && !_isTransferring)
         {
             for (int i = 0; i < stepsPerFrame; i++)
                 Step();
@@ -242,19 +375,9 @@ public class SandSourcePool : SandPool
         RenderTextureUpdate();
     }
 
-    private void EnsureTransferBuffer()
-    {
-        if (transferBuffer == null || transferBuffer.count != transferLanes)
-        {
-            transferBuffer?.Release();
-            transferBuffer = new ComputeBuffer(transferLanes, sizeof(uint));
-            transferBuffer.SetData(new uint[transferLanes]);
-        }
-    }
-
     protected override void OnDestroy()
     {
+        Disconnect();
         base.OnDestroy();
-        transferBuffer?.Release();
     }
 }

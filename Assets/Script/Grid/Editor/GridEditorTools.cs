@@ -44,23 +44,30 @@ public class GridObjectEditor : Editor
     }
 }
 
-[CustomEditor(typeof(GridManager))]
-public class GridManagerEditor : Editor
+[CustomEditor(typeof(GridRenderer))]
+public class GridRendererEditor : Editor
 {
     public override void OnInspectorGUI()
     {
         DrawDefaultInspector();
 
-        GridManager manager = (GridManager)target;
+        GridRenderer renderer = (GridRenderer)target;
 
         EditorGUILayout.Space(8);
-        EditorGUILayout.LabelField("Grid Tools", EditorStyles.boldLabel);
+        EditorGUILayout.LabelField("Tilemap & Grid Tools", EditorStyles.boldLabel);
 
-        if (GUILayout.Button("Fit Bounds from Tilemap"))
+        if (GUILayout.Button("Rebuild Grid"))
         {
-            Undo.RecordObject(manager, "Fit Tilemap Bounds");
-            manager.RefreshBoundaries();
-            EditorUtility.SetDirty(manager);
+            Undo.RecordObject(renderer, "Rebuild Grid");
+            renderer.RebuildGrid();
+            EditorUtility.SetDirty(renderer);
+        }
+
+        if (GUILayout.Button("Clear Tilemaps"))
+        {
+            Undo.RecordObject(renderer, "Clear Tilemaps");
+            renderer.ClearTilemaps();
+            EditorUtility.SetDirty(renderer);
         }
     }
 }

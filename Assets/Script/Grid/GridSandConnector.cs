@@ -1,146 +1,225 @@
-using System;
 using System.Collections.Generic;
 using UnityEngine;
 
 /// <summary>
-/// Controller responsible for automatic proximity connection between Source and Receiver on the Grid.
-/// When a receiver is moved to a new cell, it searches adjacent cells (Up, Down, Left, Right).
-/// If a Source matching all conditions is found, it connects them:
-/// - Direction matching: relative position maps to allowed source output side.
-/// - Color matching: source provides the sand type accepted by the receiver.
-/// - Capacity check: receiver is not already full.
+/// Manages automatic connections between GridSandSource and GridSandReceiver.
+/// Supports multi-cell sources: Each cell of a source can independently connect
+/// to a separate receiver below or adjacent to it.
 /// </summary>
 public class GridSandConnector : MonoBehaviour
 {
-    private readonly struct NeighborDirection
-    {
-        public readonly Vector2Int offset;
-        public readonly SandPool.Side sourceFromSide;
-        public readonly SandPool.Side receiverToSide;
-
-        public NeighborDirection(Vector2Int offset, SandPool.Side fromSide, SandPool.Side toSide)
-        {
-            this.offset = offset;
-            this.sourceFromSide = fromSide;
-            this.receiverToSide = toSide;
-        }
-    }
-
-    private static readonly NeighborDirection[] Directions = new NeighborDirection[]
-    {
-        // Source is ABOVE receiver -> flows from Source.Bottom into Receiver.Top
-        new NeighborDirection(Vector2Int.up, SandPool.Side.Bottom, SandPool.Side.Top),
-        // Source is BELOW receiver -> flows from Source.Top into Receiver.Bottom
-        new NeighborDirection(Vector2Int.down, SandPool.Side.Top, SandPool.Side.Bottom),
-        // Source is LEFT of receiver -> flows from Source.Right into Receiver.Left
-        new NeighborDirection(Vector2Int.left, SandPool.Side.Right, SandPool.Side.Left),
-        // Source is RIGHT of receiver -> flows from Source.Left into Receiver.Right
-        new NeighborDirection(Vector2Int.right, SandPool.Side.Left, SandPool.Side.Right),
-    };
-
     [Header("Dependencies")]
     [SerializeField] private GridManager _gridManager;
 
-    [Header("Connection Conditions")]
-    [SerializeField] private bool _requireColorMatch = true;
-
+    [Header("Settings")]
     [SerializeField] private bool _autoConnectOnPlaced = true;
 
-    private readonly Dictionary<SandReceiverPool, SandSourcePool> _activeConnections = new Dictionary<SandReceiverPool, SandSourcePool>();
+    private static readonly Vector2Int[] CardinalOffsets =
+    {
+        Vector2Int.down,
+        Vector2Int.left,
+        Vector2Int.right,
+        Vector2Int.up
+    };
 
-    public GridManager Manager { get => _gridManager; set => _gridManager = value; }
-    public bool RequireColorMatch { get => _requireColorMatch; set => _requireColorMatch = value; }
-    public bool AutoConnectOnPlaced { get => _autoConnectOnPlaced; set => _autoConnectOnPlaced = value; }
+    private void Awake()
+    {
+        _gridManager = GridManager.Instance;
+    }
 
     private void OnEnable()
     {
-        if (_gridManager != null)
-        {
-            _gridManager.OnObjectPlaced += HandleObjectPlaced;
-            _gridManager.OnObjectRemoved += HandleObjectRemoved;
-        }
+        _gridManager.OnObjectPlaced += HandleObjectPlaced;
+        _gridManager.OnObjectMoved += HandleObjectMoved;
+        _gridManager.OnObjectRemoved += HandleObjectRemoved;
+        SubscribeToPickupEvents();
     }
 
     private void OnDisable()
     {
-        if (_gridManager != null)
+        _gridManager.OnObjectPlaced -= HandleObjectPlaced;
+        _gridManager.OnObjectMoved -= HandleObjectMoved;
+        _gridManager.OnObjectRemoved -= HandleObjectRemoved;
+        UnsubscribeFromPickupEvents();
+    }
+
+    private void Start()
+    {
+        EvaluateAllGridConnections();
+    }
+
+    private void SubscribeToPickupEvents()
+    {
+        GridObject[] objects = FindObjectsByType<GridObject>(FindObjectsSortMode.None);
+        for (int i = 0; i < objects.Length; i++)
         {
-            _gridManager.OnObjectPlaced -= HandleObjectPlaced;
-            _gridManager.OnObjectRemoved -= HandleObjectRemoved;
+            objects[i].OnPickup += HandleObjectPickup;
+        }
+    }
+
+    private void UnsubscribeFromPickupEvents()
+    {
+        GridObject[] objects = FindObjectsByType<GridObject>(FindObjectsSortMode.None);
+        for (int i = 0; i < objects.Length; i++)
+        {
+            objects[i].OnPickup -= HandleObjectPickup;
+        }
+    }
+
+    private void HandleObjectPickup(GridObject obj)
+    {
+        if (obj.TryGetComponent(out GridSandSource source) && source.HasActiveConnections)
+        {
+            source.DisconnectAll();
+            return;
+        }
+
+        if (obj.TryGetComponent(out GridSandReceiver receiver) && receiver.IsConnected)
+        {
+            BreakReceiverConnection(receiver);
         }
     }
 
     private void HandleObjectPlaced(GridObject obj, Vector2Int cell)
     {
-        if (!_autoConnectOnPlaced || _gridManager == null) return;
+        if (!_autoConnectOnPlaced) return;
+        EvaluateObjectConnections(obj);
+    }
 
-        SandReceiverPool receiverPool = obj.GetComponent<SandReceiverPool>();
-        if (receiverPool != null)
+    private void HandleObjectMoved(GridObject obj, Vector2Int oldCell, Vector2Int newCell)
+    {
+        if (obj.TryGetComponent(out GridSandSource source) && source.HasActiveConnections)
         {
-            EvaluateReceiver(receiverPool, cell);
-            return;
+            var activePairs = new List<KeyValuePair<Vector2Int, GridSandReceiver>>(source.ActiveConnections);
+            for (int i = 0; i < activePairs.Count; i++)
+            {
+                Vector2Int sourceCell = activePairs[i].Key;
+                GridSandReceiver receiver = activePairs[i].Value;
+
+                if (!IsCellAdjacentToObject(sourceCell, receiver.GridObject))
+                {
+                    source.Disconnect(receiver);
+                    receiver.Disconnect();
+                }
+            }
         }
 
-        SandSourcePool sourcePool = obj.GetComponent<SandSourcePool>();
-        if (sourcePool != null)
+        if (obj.TryGetComponent(out GridSandReceiver receiverComp) && receiverComp.IsConnected)
         {
-            EvaluateSource(sourcePool, cell);
+            if (!AreObjectsAdjacent(receiverComp.ConnectedSource.GridObject, receiverComp.GridObject))
+            {
+                BreakReceiverConnection(receiverComp);
+            }
+        }
+
+        if (_autoConnectOnPlaced)
+        {
+            EvaluateObjectConnections(obj);
         }
     }
 
     private void HandleObjectRemoved(GridObject obj)
     {
-        SandReceiverPool receiverPool = obj.GetComponent<SandReceiverPool>();
-        if (receiverPool != null)
+        HandleObjectPickup(obj);
+    }
+
+    [ContextMenu("Evaluate All Connections")]
+    public void EvaluateAllGridConnections()
+    {
+        GridSandSource[] sources = FindObjectsByType<GridSandSource>(FindObjectsSortMode.None);
+        for (int i = 0; i < sources.Length; i++)
         {
-            DisconnectReceiver(receiverPool);
+            EvaluateSourceConnections(sources[i]);
+        }
+    }
+
+    public void EvaluateObjectConnections(GridObject obj)
+    {
+        if (obj.TryGetComponent(out GridSandSource source))
+        {
+            EvaluateSourceConnections(source);
             return;
         }
 
-        SandSourcePool sourcePool = obj.GetComponent<SandSourcePool>();
-        if (sourcePool != null)
+        if (obj.TryGetComponent(out GridSandReceiver receiver) && !receiver.IsConnected)
         {
-            sourcePool.Disconnect();
-            RemoveSourceFromConnections(sourcePool);
+            EvaluateReceiverConnections(receiver);
         }
     }
 
-    /// <summary>
-    /// Searches around receiverCell for an adjacent Source that matches all conditions,
-    /// and connects them if found. Disconnects if no valid source is adjacent.
-    /// </summary>
-    public bool EvaluateReceiver(SandReceiverPool receiverPool, Vector2Int receiverCell)
+    public void EvaluateSourceConnections(GridSandSource source)
     {
-        DisconnectReceiver(receiverPool);
+        Vector2Int origin = source.GridObject.GridPosition;
+        Vector2Int size = source.GridObject.Size;
 
-        if (receiverPool == null || receiverPool.IsFull)
-            return false;
-
-        int acceptedType = receiverPool.GetAcceptedType();
-
-        foreach (var dir in Directions)
+        for (int x = 0; x < size.x; x++)
         {
-            Vector2Int neighborCell = receiverCell + dir.offset;
-            GridObject neighborObj = _gridManager.GetObjectAt(neighborCell);
-            if (neighborObj == null) continue;
-
-            SandSourcePool sourcePool = neighborObj.GetComponent<SandSourcePool>();
-            if (sourcePool != null)
+            for (int y = 0; y < size.y; y++)
             {
-                // Condition 1: Source allows output from this direction
-                if (!sourcePool.IsDirectionAllowed(dir.sourceFromSide))
-                    continue;
+                Vector2Int sourceCell = origin + new Vector2Int(x, y);
+                if (source.IsCellConnected(sourceCell)) continue;
 
-                // Condition 2: Color match
-                if (_requireColorMatch && !sourcePool.HasSandType(acceptedType))
-                    continue;
-
-                // Connect source to receiver
-                bool connected = sourcePool.Connect(receiverPool, dir.sourceFromSide, dir.receiverToSide);
-                if (connected)
+                for (int i = 0; i < CardinalOffsets.Length; i++)
                 {
-                    _activeConnections[receiverPool] = sourcePool;
-                    return true;
+                    Vector2Int neighborCell = sourceCell + CardinalOffsets[i];
+                    GridObject neighborObj = _gridManager.GetObjectAt(neighborCell);
+
+                    if (!neighborObj || neighborObj == source.GridObject) continue;
+
+                    if (neighborObj.TryGetComponent(out GridSandReceiver receiver) && !receiver.IsConnected && source.CanConnect(receiver) && receiver.CanConnect(source))
+                    {
+                        EstablishConnection(source, sourceCell, receiver);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    public void EvaluateReceiverConnections(GridSandReceiver receiver)
+    {
+        if (receiver.IsConnected) return;
+
+        Vector2Int origin = receiver.GridObject.GridPosition;
+        Vector2Int size = receiver.GridObject.Size;
+
+        for (int x = 0; x < size.x; x++)
+        {
+            for (int y = 0; y < size.y; y++)
+            {
+                Vector2Int receiverCell = origin + new Vector2Int(x, y);
+
+                for (int i = 0; i < CardinalOffsets.Length; i++)
+                {
+                    Vector2Int neighborCell = receiverCell + CardinalOffsets[i];
+                    GridObject neighborObj = _gridManager.GetObjectAt(neighborCell);
+
+                    if (!neighborObj || neighborObj == receiver.GridObject) continue;
+
+                    if (neighborObj.TryGetComponent(out GridSandSource source) && !source.IsCellConnected(neighborCell) && source.CanConnect(receiver) && receiver.CanConnect(source))
+                    {
+                        EstablishConnection(source, neighborCell, receiver);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    public bool IsCellAdjacentToObject(Vector2Int cell, GridObject obj)
+    {
+        Vector2Int origin = obj.GridPosition;
+        Vector2Int size = obj.Size;
+
+        for (int x = 0; x < size.x; x++)
+        {
+            for (int y = 0; y < size.y; y++)
+            {
+                Vector2Int objCell = origin + new Vector2Int(x, y);
+                for (int i = 0; i < CardinalOffsets.Length; i++)
+                {
+                    if (objCell + CardinalOffsets[i] == cell)
+                        return true;
                 }
             }
         }
@@ -148,41 +227,29 @@ public class GridSandConnector : MonoBehaviour
         return false;
     }
 
-    /// <summary>
-    /// When a Source is placed, searches around its adjacent cells for any Receiver needing sand.
-    /// </summary>
-    public bool EvaluateSource(SandSourcePool sourcePool, Vector2Int sourceCell)
+    public bool AreObjectsAdjacent(GridObject a, GridObject b)
     {
-        if (sourcePool == null) return false;
+        Vector2Int originA = a.GridPosition;
+        Vector2Int sizeA = a.Size;
+        Vector2Int originB = b.GridPosition;
+        Vector2Int sizeB = b.Size;
 
-        sourcePool.Disconnect();
-        RemoveSourceFromConnections(sourcePool);
-
-        foreach (var dir in Directions)
+        for (int ax = 0; ax < sizeA.x; ax++)
         {
-            Vector2Int neighborCell = sourceCell + dir.offset;
-            GridObject neighborObj = _gridManager.GetObjectAt(neighborCell);
-            if (neighborObj == null) continue;
-
-            SandReceiverPool receiverPool = neighborObj.GetComponent<SandReceiverPool>();
-            if (receiverPool != null)
+            for (int ay = 0; ay < sizeA.y; ay++)
             {
-                if (receiverPool.IsFull) continue;
-
-                SandPool.Side fromSide = GetSourceToNeighborSide(dir.offset);
-                SandPool.Side toSide = GetOppositeSide(fromSide);
-
-                if (!sourcePool.IsDirectionAllowed(fromSide))
-                    continue;
-
-                if (_requireColorMatch && !sourcePool.HasSandType(receiverPool.GetAcceptedType()))
-                    continue;
-
-                bool connected = sourcePool.Connect(receiverPool, fromSide, toSide);
-                if (connected)
+                Vector2Int cellA = originA + new Vector2Int(ax, ay);
+                for (int bx = 0; bx < sizeB.x; bx++)
                 {
-                    _activeConnections[receiverPool] = sourcePool;
-                    return true;
+                    for (int by = 0; by < sizeB.y; by++)
+                    {
+                        Vector2Int cellB = originB + new Vector2Int(bx, by);
+                        for (int i = 0; i < CardinalOffsets.Length; i++)
+                        {
+                            if (cellA + CardinalOffsets[i] == cellB)
+                                return true;
+                        }
+                    }
                 }
             }
         }
@@ -190,49 +257,18 @@ public class GridSandConnector : MonoBehaviour
         return false;
     }
 
-    /// <summary>
-    /// Disconnects any active source connected to this receiver.
-    /// </summary>
-    public void DisconnectReceiver(SandReceiverPool receiverPool)
+    private void EstablishConnection(GridSandSource source, Vector2Int sourceCell, GridSandReceiver receiver)
     {
-        if (receiverPool == null) return;
-
-        if (_activeConnections.TryGetValue(receiverPool, out SandSourcePool source))
-        {
-            if (source != null && source.ActiveReceiver == receiverPool)
-            {
-                source.Disconnect();
-            }
-            _activeConnections.Remove(receiverPool);
-        }
+        source.Connect(sourceCell, receiver);
+        receiver.Connect(source);
+        Debug.Log($"[GridSandConnector] Connected Source '{source.name}' at cell {sourceCell} ---> Receiver '{receiver.name}'");
     }
 
-    private void RemoveSourceFromConnections(SandSourcePool sourcePool)
+    private void BreakReceiverConnection(GridSandReceiver receiver)
     {
-        List<SandReceiverPool> toRemove = new List<SandReceiverPool>();
-        foreach (var kvp in _activeConnections)
-        {
-            if (kvp.Value == sourcePool) toRemove.Add(kvp.Key);
-        }
-        foreach (var r in toRemove) _activeConnections.Remove(r);
-    }
-
-    private SandPool.Side GetSourceToNeighborSide(Vector2Int offset)
-    {
-        if (offset == Vector2Int.down) return SandPool.Side.Bottom;
-        if (offset == Vector2Int.up) return SandPool.Side.Top;
-        if (offset == Vector2Int.left) return SandPool.Side.Left;
-        return SandPool.Side.Right;
-    }
-
-    private SandPool.Side GetOppositeSide(SandPool.Side side)
-    {
-        switch (side)
-        {
-            case SandPool.Side.Bottom: return SandPool.Side.Top;
-            case SandPool.Side.Top: return SandPool.Side.Bottom;
-            case SandPool.Side.Left: return SandPool.Side.Right;
-            default: return SandPool.Side.Left;
-        }
+        GridSandSource source = receiver.ConnectedSource;
+        receiver.Disconnect();
+        source.Disconnect(receiver);
+        Debug.Log($"[GridSandConnector] Disconnected Receiver '{receiver.name}'");
     }
 }

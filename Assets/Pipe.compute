@@ -1,5 +1,6 @@
 #pragma kernel Advance
 #pragma kernel Render
+#pragma kernel ConsumeTail
 
 #define SHADES 8
 
@@ -10,6 +11,9 @@ float4 EmptyColor;
 
 int Length;
 int Lanes;
+
+RWStructuredBuffer<int> ConsumeCounter; // [0] = count, [1] = capacity
+int AcceptType;
 
 // Mỗi thread xử lý 1 lane: duyệt từ cuối về đầu để cả đoàn hạt dịch 1 ô cùng lúc.
 [numthreads(64, 1, 1)]
@@ -30,6 +34,33 @@ void Advance(uint3 id : SV_DispatchThreadID)
             Buf[b + p] = 0;
         }
     }
+}
+
+[numthreads(64, 1, 1)]
+void ConsumeTail(uint3 id : SV_DispatchThreadID)
+{
+    int lane = (int)id.x;
+    if (lane >= Lanes)
+        return;
+
+    uint tail = (uint)lane * (uint)Length + (uint)(Length - 1);
+    uint v = Buf[tail];
+    if (v == 0)
+        return;
+
+    uint type = v & 15u;
+    if (AcceptType > 0 && (int)type != AcceptType)
+        return;
+
+    int prev;
+    InterlockedAdd(ConsumeCounter[0], 1, prev);
+    if (prev >= ConsumeCounter[1])
+    {
+        InterlockedAdd(ConsumeCounter[0], -1);
+        return;
+    }
+
+    Buf[tail] = 0;
 }
 
 [numthreads(8, 8, 1)]

@@ -1,0 +1,98 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 231efec0e94f49faa8e38d8f91d39b58, type: 3}
+  m_Name: NewLevelData
+  m_EditorClassIdentifier: 
+  cellSize: {x: 1, y: 1}
+  cellGap: {x: 0, y: 0}
+  cells:
+  - {x: 0, y: 0}
+  - {x: 0, y: 1}
+  - {x: 0, y: 2}
+  - {x: 0, y: 3}
+  - {x: 0, y: 4}
+  - {x: 0, y: 5}
+  - {x: 0, y: 6}
+  - {x: 0, y: 7}
+  - {x: 1, y: 0}
+  - {x: 1, y: 1}
+  - {x: 1, y: 2}
+  - {x: 1, y: 3}
+  - {x: 1, y: 4}
+  - {x: 1, y: 5}
+  - {x: 1, y: 6}
+  - {x: 1, y: 7}
+  - {x: 2, y: 0}
+  - {x: 2, y: 1}
+  - {x: 2, y: 2}
+  - {x: 2, y: 3}
+  - {x: 2, y: 4}
+  - {x: 2, y: 5}
+  - {x: 2, y: 6}
+  - {x: 2, y: 7}
+  - {x: 3, y: 0}
+  - {x: 3, y: 1}
+  - {x: 3, y: 2}
+  - {x: 3, y: 3}
+  - {x: 3, y: 4}
+  - {x: 3, y: 5}
+  - {x: 3, y: 6}
+  - {x: 3, y: 7}
+  - {x: 4, y: 0}
+  - {x: 4, y: 1}
+  - {x: 4, y: 2}
+  - {x: 4, y: 3}
+  - {x: 4, y: 4}
+  - {x: 4, y: 5}
+  - {x: 4, y: 6}
+  - {x: 4, y: 7}
+  - {x: 5, y: 1}
+  - {x: 5, y: 2}
+  - {x: 5, y: 3}
+  - {x: 5, y: 5}
+  - {x: 5, y: 6}
+  - {x: 5, y: 7}
+  - {x: 6, y: 0}
+  - {x: 6, y: 1}
+  - {x: 6, y: 2}
+  - {x: 6, y: 3}
+  - {x: 6, y: 4}
+  - {x: 6, y: 5}
+  - {x: 6, y: 6}
+  - {x: 6, y: 7}
+  - {x: 7, y: 0}
+  - {x: 7, y: 1}
+  - {x: 7, y: 2}
+  - {x: 7, y: 3}
+  - {x: 7, y: 4}
+  - {x: 7, y: 5}
+  - {x: 7, y: 6}
+  - {x: 7, y: 7}
+  objects:
+  - key: 1
+    originCell: {x: 0, y: 0}
+    rotation: 0
+  - key: 1
+    originCell: {x: 0, y: 2}
+    rotation: 0
+  sources:
+  - key: source
+    cells:
+    - {x: 1, y: 0}
+    - {x: 2, y: 0}
+    rotation: 0
+    isDraggable: 0
+    layers:
+    - color: {fileID: 11400000, guid: 44590d3af9867004d95d95f34d076078, type: 2}
+      amount: 100
+    - color: {fileID: 11400000, guid: cd89021d2fcfa8e4abb06b33eb551108, type: 2}
+      amount: 100
