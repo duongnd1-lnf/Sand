@@ -73,6 +73,12 @@ public abstract class GridObject : MonoBehaviour
         _gridPosition = newPosition;
     }
 
+    public virtual Vector3 GetCellWorldPosition(Vector2Int cell)
+    {
+        Vector3 offsetWorld = Manager.CellToWorldPosition(cell) - Manager.CellToWorldPosition(_gridPosition);
+        return transform.position + offsetWorld;
+    }
+
     public void SnapToWorldPosition(Vector3 targetWorldPos, bool animate = true)
     {
         targetWorldPos.z = transform.position.z;

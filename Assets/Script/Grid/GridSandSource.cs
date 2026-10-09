@@ -5,16 +5,18 @@ using UnityEngine;
 /// <summary>
 /// Source component for sand containers on the grid.
 /// Can occupy multiple cells and contain multiple stacked sand layers.
-/// Inherits from SandPool to run compute shader simulation and visual sand rendering on a child Quad.
-/// Creates a fake visual stream line to connected receivers and flows sand out of the connected cells.
+/// Coordinates grid connections and sand transfer, delegating rendering and simulation to GridSandSourceVisual.
 /// </summary>
-public class GridSandSource : SandPool
+public class GridSandSource : MonoBehaviour
 {
     [Serializable]
     public class SandLayer
     {
         public SandColor color;
         public int amount = 100;
+        [NonSerialized] public int initialAmount = 100;
+        [NonSerialized] public int initialPixels = 0;
+        [NonSerialized] public int typeId = 1;
     }
 
     [Header("Sand Layers")]
@@ -24,20 +26,17 @@ public class GridSandSource : SandPool
 
     [Header("Transfer Settings")]
     [SerializeField] private float _transferRate = 10f;
-    [Range(2, 16)] [SerializeField] private int _drainRadius = 4;
     [Range(1, 4)] [SerializeField] private int _simStepsPerTick = 2;
 
-    [Header("Stream Visual")]
-    [SerializeField] private float _streamWidth = 0.18f;
+    [Header("Visual Reference")]
+    [SerializeField] private GridSandSourceVisual _visual;
 
-    private float _elapsed = 0f;
     private GridObject _gridObject;
-    private int _kAddSand = -1;
+    private float _frameBudgetAccumulator = 0f;
+    private float _drainedPixelAccumulator = 0f;
 
     private readonly Dictionary<Vector2Int, GridSandReceiver> _cellToReceiver = new Dictionary<Vector2Int, GridSandReceiver>();
     private readonly Dictionary<GridSandReceiver, Vector2Int> _receiverToCell = new Dictionary<GridSandReceiver, Vector2Int>();
-    private readonly Dictionary<Vector2Int, GameObject> _cellToLine = new Dictionary<Vector2Int, GameObject>();
-    private readonly Dictionary<Vector2Int, Material> _cellToLineMat = new Dictionary<Vector2Int, Material>();
 
     public event Action<Vector2Int, GridSandReceiver> OnCellConnected;
     public event Action<Vector2Int, GridSandReceiver> OnCellDisconnected;
@@ -46,6 +45,7 @@ public class GridSandSource : SandPool
 
     public GridObject GridObject => _gridObject;
     public IReadOnlyList<SandLayer> Layers => _layers;
+    public bool TopToBottom => _topToBottom;
     public bool HasActiveConnections => _cellToReceiver.Count > 0;
     public int ActiveConnectionCount => _cellToReceiver.Count;
     public IReadOnlyDictionary<Vector2Int, GridSandReceiver> ActiveConnections => _cellToReceiver;
@@ -68,259 +68,132 @@ public class GridSandSource : SandPool
     private void Awake()
     {
         _gridObject = GetComponent<GridObject>();
+        EnsureVisual();
     }
 
-    protected override void Start()
+    private void Start()
     {
-        EnsureReferences();
-        base.Start();
+        EnsureVisual();
     }
 
-    protected virtual void Update()
+    private void EnsureVisual()
     {
-        if (current == null) return;
+        if (_visual == null)
+        {
+            _visual = GetComponent<GridSandSourceVisual>();
+            if (_visual == null)
+            {
+                _visual = gameObject.AddComponent<GridSandSourceVisual>();
+            }
+        }
+        _visual.BindSource(this);
+    }
 
+    private void Update()
+    {
         if (HasActiveConnections)
         {
-            foreach (var pair in _cellToReceiver)
-            {
-                Vector2Int cell = pair.Key;
-                GridSandReceiver receiver = pair.Value;
-                if (receiver == null || !receiver.IsConnected) continue;
-
-                GetHoleCoordinates(cell, receiver, out int hx, out int hy);
-                DrainHole(hx, hy, _drainRadius);
-            }
-
-            for (int s = 0; s < _simStepsPerTick; s++)
-            {
-                Step();
-            }
-
-            RenderTextureUpdate();
+            ProcessTransfer(Time.deltaTime);
+            _visual.StepSimulation(_simStepsPerTick);
         }
         else if (_simulatePhysics)
         {
-            for (int i = 0; i < stepsPerFrame; i++)
+            _visual.StepSimulation(1);
+        }
+    }
+
+    public void ProcessTransfer(float deltaTime)
+    {
+        if (!HasContent || !HasActiveConnections) return;
+
+        SandLayer currentLayer = CurrentLayer;
+        if (currentLayer == null || currentLayer.amount <= 0) return;
+
+        int resolvedType = currentLayer.typeId;
+        float pixelsPerUnit = currentLayer.initialAmount > 0
+            ? (float)currentLayer.initialPixels / currentLayer.initialAmount
+            : (_visual.width * _visual.height / 100f);
+
+        float budgetFloat = _transferRate * deltaTime * pixelsPerUnit;
+        _frameBudgetAccumulator += budgetFloat;
+        int frameBudget = Mathf.FloorToInt(_frameBudgetAccumulator);
+        if (frameBudget <= 0) return;
+        _frameBudgetAccumulator -= frameBudget;
+
+        var connections = new List<KeyValuePair<Vector2Int, GridSandReceiver>>(_cellToReceiver);
+        for (int i = 0; i < connections.Count; i++)
+        {
+            if (currentLayer.amount <= 0) break;
+
+            Vector2Int cell = connections[i].Key;
+            GridSandReceiver receiver = connections[i].Value;
+            if (receiver == null || !receiver.IsConnected || receiver.IsFull) continue;
+
+            // 1. Cát phải rút trước! Rút từ lỗ đáy và đếm số lượng hạt thực tế bị xóa khỏi hồ
+            int actuallyDrained = _visual.DrainHole(cell, receiver, frameBudget, resolvedType, _gridObject);
+            if (actuallyDrained <= 0) continue;
+
+            // 2. Tạo hạt particle tương ứng với số cát thực tế đã rút bay vào receiver
+            _visual.EmitStreamParticles(cell, receiver, actuallyDrained, CurrentColor);
+
+            // 3. Cập nhật amount cho receiver và source tương ứng số cát đã rút
+            _drainedPixelAccumulator += actuallyDrained;
+            float amountFloat = _drainedPixelAccumulator / pixelsPerUnit;
+            int amountToAdd = Mathf.FloorToInt(amountFloat);
+            if (amountToAdd > 0)
             {
-                Step();
-            }
-            RenderTextureUpdate();
-        }
-    }
+                _drainedPixelAccumulator -= amountToAdd * pixelsPerUnit;
+                int space = receiver.Capacity - receiver.CurrentAmount;
+                int transferAmount = Mathf.Min(amountToAdd, space);
+                transferAmount = Mathf.Min(transferAmount, currentLayer.amount);
 
-    private void LateUpdate()
-    {
-        if (_cellToLine.Count == 0) return;
-
-        GridManager gm = GridManager.Instance;
-        Color activeCol = CurrentColor != null ? CurrentColor.Get(0) : Color.white;
-
-        foreach (var pair in _cellToLine)
-        {
-            Vector2Int sourceCell = pair.Key;
-            GameObject line = pair.Value;
-            if (line == null) continue;
-
-            if (!_cellToReceiver.TryGetValue(sourceCell, out GridSandReceiver receiver) || receiver == null)
-                continue;
-
-            Vector3 from = gm.CellToWorldPosition(sourceCell);
-            Vector3 to = gm.CellToWorldPosition(receiver.GridObject.GridPosition);
-            PositionStreamLine(line, from, to);
-
-            if (_cellToLineMat.TryGetValue(sourceCell, out Material mat) && mat != null)
-            {
-                mat.color = activeCol;
-            }
-        }
-    }
-
-    private void DrainHole(int x, int y, int radius)
-    {
-        if (_kAddSand < 0) _kAddSand = shader.FindKernel("AddSand");
-
-        shader.SetInt("BrushX", x);
-        shader.SetInt("BrushY", y);
-        shader.SetInt("BrushRadius", radius);
-        shader.SetInt("BrushType", 0);
-        shader.SetInt("BrushTypeDel", -1);
-        shader.SetBuffer(_kAddSand, "Current", current);
-        shader.Dispatch(_kAddSand, gx, gy, 1);
-    }
-
-    private void GetHoleCoordinates(Vector2Int sourceCell, GridSandReceiver receiver, out int holeX, out int holeY)
-    {
-        float tx = 0.5f;
-        if (_gridObject != null)
-        {
-            tx = (sourceCell.x - _gridObject.GridPosition.x + 0.5f) / Mathf.Max(1, _gridObject.Size.x);
-        }
-        holeX = Mathf.Clamp(Mathf.RoundToInt(tx * width), 0, width - 1);
-        holeY = 0;
-
-        Vector2Int diff = receiver.GridObject.GridPosition - sourceCell;
-        if (diff.y > 0)
-        {
-            holeY = height - 1;
-        }
-        else if (diff.y < 0)
-        {
-            holeY = 0;
-        }
-        else if (diff.x < 0)
-        {
-            holeX = 0;
-            float ty = _gridObject != null ? (sourceCell.y - _gridObject.GridPosition.y + 0.5f) / Mathf.Max(1, _gridObject.Size.y) : 0.5f;
-            holeY = Mathf.Clamp(Mathf.RoundToInt(ty * height), 0, height - 1);
-        }
-        else if (diff.x > 0)
-        {
-            holeX = width - 1;
-            float ty = _gridObject != null ? (sourceCell.y - _gridObject.GridPosition.y + 0.5f) / Mathf.Max(1, _gridObject.Size.y) : 0.5f;
-            holeY = Mathf.Clamp(Mathf.RoundToInt(ty * height), 0, height - 1);
-        }
-    }
-
-    private void EnsureReferences()
-    {
-        if (target == null)
-        {
-            target = GetComponentInChildren<MeshRenderer>();
-        }
-
-        if (target != null && (target.sharedMaterial == null || target.sharedMaterial.shader.name == "Universal Render Pipeline/Lit"))
-        {
-            Shader unlit = Shader.Find("Universal Render Pipeline/2D/Sprite-Unlit")
-                        ?? Shader.Find("Sprites/Default")
-                        ?? Shader.Find("Universal Render Pipeline/Unlit");
-            if (unlit != null)
-            {
-                target.material = new Material(unlit);
-            }
-        }
-
-#if UNITY_EDITOR
-        if (shader == null)
-        {
-            shader = UnityEditor.AssetDatabase.LoadAssetAtPath<ComputeShader>("Assets/Sand.compute");
-        }
-        if (palette == null)
-        {
-            palette = UnityEditor.AssetDatabase.LoadAssetAtPath<SandPalette>("Assets/Data/palette.asset");
-        }
-#endif
-    }
-
-#if UNITY_EDITOR
-    private void Reset()
-    {
-        EnsureReferences();
-    }
-
-    private void OnValidate()
-    {
-        EnsureReferences();
-    }
-#endif
-
-    protected override void OnPoolInitialized()
-    {
-        _kAddSand = shader.FindKernel("AddSand");
-        InitializeFullSand();
-    }
-
-    [ContextMenu("Rebuild Sand")]
-    public void InitializeFullSand()
-    {
-        if (current == null) return;
-
-        int totalPixels = width * height;
-        uint[] data = new uint[totalPixels];
-
-        if (_layers != null && _layers.Count > 0)
-        {
-            int totalConfiguredAmount = TotalAmount;
-            if (totalConfiguredAmount <= 0)
-            {
-                totalConfiguredAmount = _layers.Count * 100;
-            }
-
-            int currentRow = _topToBottom ? height - 1 : 0;
-            int currentCol = 0;
-
-            for (int i = 0; i < _layers.Count; i++)
-            {
-                SandLayer layer = _layers[i];
-                if (layer == null) continue;
-
-                int count;
-                if (i == _layers.Count - 1)
+                if (transferAmount > 0)
                 {
-                    count = _topToBottom
-                        ? (currentRow + 1) * width - currentCol
-                        : (height - currentRow) * width - currentCol;
-                }
-                else
-                {
-                    float ratio = (float)layer.amount / totalConfiguredAmount;
-                    count = Mathf.RoundToInt(ratio * totalPixels);
-                }
-
-                int resolvedType = GetResolvedSandType(layer);
-
-                for (int p = 0; p < count; p++)
-                {
-                    if (_topToBottom && currentRow < 0) break;
-                    if (!_topToBottom && currentRow >= height) break;
-
-                    uint shade = (uint)UnityEngine.Random.Range(0, SandPalette.Shades);
-                    uint pixelValue = (uint)resolvedType | (shade << 4);
-
-                    data[currentRow * width + currentCol] = pixelValue;
-
-                    currentCol++;
-                    if (currentCol >= width)
-                    {
-                        currentCol = 0;
-                        if (_topToBottom) currentRow--;
-                        else currentRow++;
-                    }
+                    receiver.AddAmount(transferAmount);
+                    currentLayer.amount -= transferAmount;
                 }
             }
         }
 
-        current.SetData(data);
-        next.SetData(data);
-        RenderTextureUpdate();
+        if (currentLayer.amount <= 0)
+        {
+            PurgeCurrentLayerAndAdvance(resolvedType);
+        }
     }
 
-    private int GetResolvedSandType(SandLayer layer)
+    private void PurgeCurrentLayerAndAdvance(int resolvedType)
     {
-        if (layer.color != null && palette != null && palette.types != null)
-        {
-            int idx = Array.IndexOf(palette.types, layer.color);
-            if (idx >= 0) return idx + 1;
+        _visual.PurgeLayer(resolvedType);
 
-            Color targetCol = layer.color.Get(0);
-            for (int i = 0; i < palette.TypeCount; i++)
+        _frameBudgetAccumulator = 0f;
+        _drainedPixelAccumulator = 0f;
+
+        if (_layers.Count > 0)
+        {
+            _layers.RemoveAt(0);
+        }
+
+        if (_layers.Count == 0)
+        {
+            _visual.ClearAll();
+            DisconnectAll();
+            return;
+        }
+
+        var receivers = new List<GridSandReceiver>(_receiverToCell.Keys);
+        for (int i = 0; i < receivers.Count; i++)
+        {
+            GridSandReceiver r = receivers[i];
+            if (r.TargetColor != CurrentColor)
             {
-                if (palette.types[i] != null && palette.types[i].Get(0) == targetCol)
-                    return i + 1;
+                Disconnect(r);
+                r.Disconnect();
             }
         }
-        return 1;
     }
 
-    public bool IsCellConnected(Vector2Int sourceCell)
-    {
-        return _cellToReceiver.ContainsKey(sourceCell);
-    }
-
-    public bool IsConnectedTo(GridSandReceiver receiver)
-    {
-        return _receiverToCell.ContainsKey(receiver);
-    }
+    public bool IsCellConnected(Vector2Int sourceCell) => _cellToReceiver.ContainsKey(sourceCell);
+    public bool IsConnectedTo(GridSandReceiver receiver) => _receiverToCell.ContainsKey(receiver);
 
     public bool CanConnect(GridSandReceiver receiver)
     {
@@ -339,7 +212,7 @@ public class GridSandSource : SandPool
         _cellToReceiver[sourceCell] = receiver;
         _receiverToCell[receiver] = sourceCell;
 
-        CreateFakeLine(sourceCell, receiver);
+        _visual.CreateStream(sourceCell, receiver);
 
         OnCellConnected?.Invoke(sourceCell, receiver);
         OnConnected?.Invoke(receiver);
@@ -352,7 +225,7 @@ public class GridSandSource : SandPool
         _cellToReceiver.Remove(sourceCell);
         _receiverToCell.Remove(receiver);
 
-        DestroyFakeLine(sourceCell);
+        _visual.DestroyStream(sourceCell);
 
         OnCellDisconnected?.Invoke(sourceCell, receiver);
         if (_cellToReceiver.Count == 0)
@@ -369,12 +242,7 @@ public class GridSandSource : SandPool
 
     public void DisconnectAll()
     {
-        foreach (var go in _cellToLine.Values)
-        {
-            if (go != null) Destroy(go);
-        }
-        _cellToLine.Clear();
-        _cellToLineMat.Clear();
+        _visual.DestroyAllStreams();
 
         if (_cellToReceiver.Count == 0) return;
 
@@ -386,72 +254,6 @@ public class GridSandSource : SandPool
         }
     }
 
-    private void CreateFakeLine(Vector2Int sourceCell, GridSandReceiver receiver)
-    {
-        GridManager gm = GridManager.Instance;
-        Vector3 from = gm.CellToWorldPosition(sourceCell);
-        Vector3 to = gm.CellToWorldPosition(receiver.GridObject.GridPosition);
-
-        GameObject go = GameObject.CreatePrimitive(PrimitiveType.Quad);
-        go.name = $"FakeLine_{sourceCell}";
-        Collider col = go.GetComponent<Collider>();
-        if (col != null) Destroy(col);
-
-        go.transform.SetParent(transform, true);
-
-        MeshRenderer mr = go.GetComponent<MeshRenderer>();
-        Shader s = Shader.Find("Universal Render Pipeline/2D/Sprite-Unlit")
-                ?? Shader.Find("Sprites/Default")
-                ?? Shader.Find("Universal Render Pipeline/Unlit");
-
-        Material mat = new Material(s);
-        Color colVal = CurrentColor != null ? CurrentColor.Get(0) : Color.yellow;
-        mat.color = colVal;
-        mr.material = mat;
-
-        if (target != null)
-        {
-            mr.sortingLayerID = target.sortingLayerID;
-            mr.sortingOrder = target.sortingOrder + 1;
-        }
-
-        PositionStreamLine(go, from, to);
-        _cellToLine[sourceCell] = go;
-        _cellToLineMat[sourceCell] = mat;
-    }
-
-    private void PositionStreamLine(GameObject go, Vector3 from, Vector3 to)
-    {
-        from.z = transform.position.z - 0.01f;
-        to.z = transform.position.z - 0.01f;
-
-        Vector3 dir = to - from;
-        float dist = dir.magnitude;
-        if (dist < 0.001f)
-        {
-            go.SetActive(false);
-            return;
-        }
-
-        go.SetActive(true);
-        Vector3 center = (from + to) * 0.5f;
-        float angle = Mathf.Atan2(dir.y, dir.x) * Mathf.Rad2Deg;
-
-        go.transform.position = center;
-        go.transform.rotation = Quaternion.Euler(0f, 0f, angle);
-        go.transform.localScale = new Vector3(dist, _streamWidth, 1f);
-    }
-
-    private void DestroyFakeLine(Vector2Int sourceCell)
-    {
-        if (_cellToLine.TryGetValue(sourceCell, out GameObject line))
-        {
-            if (line != null) Destroy(line);
-            _cellToLine.Remove(sourceCell);
-            _cellToLineMat.Remove(sourceCell);
-        }
-    }
-
     public void InitializeLayers(IEnumerable<SandLayer> layers)
     {
         _layers.Clear();
@@ -460,9 +262,9 @@ public class GridSandSource : SandPool
             _layers.Add(new SandLayer { color = l.color, amount = l.amount });
         }
 
-        if (Ready)
+        if (_visual != null && _visual.Ready)
         {
-            InitializeFullSand();
+            _visual.InitializeSandLayers(_layers, _topToBottom);
         }
     }
 
@@ -473,48 +275,19 @@ public class GridSandSource : SandPool
         CurrentLayer.amount -= amount;
         if (CurrentLayer.amount <= 0)
         {
-            _layers.RemoveAt(0);
-
-            if (_layers.Count == 0)
-            {
-                ClearAll();
-            }
-
-            var receivers = new List<GridSandReceiver>(_receiverToCell.Keys);
-            for (int i = 0; i < receivers.Count; i++)
-            {
-                GridSandReceiver r = receivers[i];
-                if (_layers.Count == 0 || r.TargetColor != CurrentColor)
-                {
-                    Disconnect(r);
-                    r.Disconnect();
-                }
-            }
+            PurgeCurrentLayerAndAdvance(CurrentLayer.typeId);
         }
     }
 
     public int Tick(float deltaTime)
     {
         if (!HasContent || !HasActiveConnections) return 0;
-
-        _elapsed += deltaTime;
-        float interval = _transferRate > 0f ? 1f / _transferRate : float.MaxValue;
-
-        if (_elapsed < interval) return 0;
-
-        int ticks = Mathf.FloorToInt(_elapsed / interval);
-        _elapsed -= ticks * interval;
-
         int unitsPerTick = Mathf.Max(1, Mathf.RoundToInt(_transferRate));
-        int amount = ticks * unitsPerTick;
-        amount = Mathf.Min(amount, CurrentLayer.amount);
-        return amount;
+        return Mathf.Min(unitsPerTick, CurrentLayer.amount);
     }
 
-    protected override void OnDestroy()
+    private void OnDestroy()
     {
         DisconnectAll();
-        base.OnDestroy();
-        if (shader != null) Destroy(shader);
     }
 }

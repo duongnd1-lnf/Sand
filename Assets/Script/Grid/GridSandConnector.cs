@@ -2,30 +2,25 @@ using System.Collections.Generic;
 using UnityEngine;
 
 /// <summary>
-/// Manages automatic connections between GridSandSource and GridSandReceiver.
-/// Supports multi-cell sources: Each cell of a source can independently connect
-/// to a separate receiver below or adjacent to it.
+/// Manages automatic proximity-based connections between GridSandSource and GridSandReceiver.
+/// Continuously searches within a configurable radius around each receiver for matching sand colors.
+/// Connects to the nearest candidate source cell and streams sand dynamically as objects move.
 /// </summary>
 public class GridSandConnector : MonoBehaviour
 {
-    [Header("Settings")]
+    [Header("Connection Range Settings")]
+    [SerializeField] private float _connectionRange = 2.0f;
+    [SerializeField] private float _disconnectBuffer = 0.35f;
+    [SerializeField] private bool _continuousEvaluation = true;
     [SerializeField] private bool _autoConnectOnPlaced = true;
 
-    private static readonly Vector2Int[] CardinalOffsets =
-    {
-        Vector2Int.down,
-        Vector2Int.left,
-        Vector2Int.right,
-        Vector2Int.up
-    };
-
+    public float ConnectionRange => _connectionRange;
 
     private void Start()
     {
         GridManager.Instance.OnObjectPlaced += HandleObjectPlaced;
         GridManager.Instance.OnObjectMoved += HandleObjectMoved;
         GridManager.Instance.OnObjectRemoved += HandleObjectRemoved;
-        SubscribeToPickupEvents();
         EvaluateAllGridConnections();
     }
 
@@ -34,56 +29,33 @@ public class GridSandConnector : MonoBehaviour
         GridManager.Instance.OnObjectPlaced -= HandleObjectPlaced;
         GridManager.Instance.OnObjectMoved -= HandleObjectMoved;
         GridManager.Instance.OnObjectRemoved -= HandleObjectRemoved;
-        UnsubscribeFromPickupEvents();
     }
 
     private void Update()
     {
-        float dt = Time.deltaTime;
-        GridSandSource[] sources = FindObjectsByType<GridSandSource>(FindObjectsSortMode.None);
-        for (int i = 0; i < sources.Length; i++)
+        if (_continuousEvaluation)
         {
-            GridSandSource source = sources[i];
-            if (!source.HasActiveConnections) continue;
-
-            int amount = source.Tick(dt);
-            if (amount <= 0) continue;
-
-            // Transfer to each connected receiver independently
-            foreach (var pair in source.ActiveConnections)
-            {
-                pair.Value.AddAmount(amount);
-            }
-
-            // Consume from source proportional to all receivers receiving
-            source.ConsumeCurrentLayer(amount * source.ActiveConnectionCount);
+            EvaluateActiveConnections();
+            EvaluatePendingConnections();
         }
     }
 
-    private void SubscribeToPickupEvents()
+    private void HandleObjectPlaced(GridObject obj, Vector2Int cell)
     {
-        GridObject[] objects = FindObjectsByType<GridObject>(FindObjectsSortMode.None);
-        for (int i = 0; i < objects.Length; i++)
-        {
-            objects[i].OnPickup += HandleObjectPickup;
-        }
+        if (!_autoConnectOnPlaced) return;
+        EvaluateAllGridConnections();
     }
 
-    private void UnsubscribeFromPickupEvents()
+    private void HandleObjectMoved(GridObject obj, Vector2Int oldCell, Vector2Int newCell)
     {
-        GridObject[] objects = FindObjectsByType<GridObject>(FindObjectsSortMode.None);
-        for (int i = 0; i < objects.Length; i++)
-        {
-            objects[i].OnPickup -= HandleObjectPickup;
-        }
+        EvaluateAllGridConnections();
     }
 
-    private void HandleObjectPickup(GridObject obj)
+    private void HandleObjectRemoved(GridObject obj)
     {
-        if (obj.TryGetComponent(out GridSandSource source) && source.HasActiveConnections)
+        if (obj.TryGetComponent(out GridSandSource source))
         {
             source.DisconnectAll();
-            return;
         }
 
         if (obj.TryGetComponent(out GridSandReceiver receiver) && receiver.IsConnected)
@@ -92,183 +64,173 @@ public class GridSandConnector : MonoBehaviour
         }
     }
 
-    private void HandleObjectPlaced(GridObject obj, Vector2Int cell)
+    [ContextMenu("Evaluate All Connections")]
+    public void EvaluateAllGridConnections()
     {
-        if (!_autoConnectOnPlaced) return;
-        EvaluateObjectConnections(obj);
+        EvaluateActiveConnections();
+        EvaluatePendingConnections();
     }
 
-    private void HandleObjectMoved(GridObject obj, Vector2Int oldCell, Vector2Int newCell)
+    /// <summary>
+    /// Validates existing connections and breaks them if out of range, full, empty, or mismatched color.
+    /// </summary>
+    public void EvaluateActiveConnections()
     {
-        if (obj.TryGetComponent(out GridSandSource source) && source.HasActiveConnections)
+        GridSandSource[] sources = FindObjectsByType<GridSandSource>(FindObjectsSortMode.None);
+        float maxAllowedDist = (_connectionRange + _disconnectBuffer) * GetCellStepMagnitude();
+
+        for (int s = 0; s < sources.Length; s++)
         {
+            GridSandSource source = sources[s];
+            if (!source.HasActiveConnections) continue;
+
             var activePairs = new List<KeyValuePair<Vector2Int, GridSandReceiver>>(source.ActiveConnections);
             for (int i = 0; i < activePairs.Count; i++)
             {
                 Vector2Int sourceCell = activePairs[i].Key;
                 GridSandReceiver receiver = activePairs[i].Value;
 
-                if (!IsCellAdjacentToObject(sourceCell, receiver.GridObject))
+                bool shouldDisconnect = receiver.IsFull
+                                     || !source.HasContent
+                                     || source.CurrentColor != receiver.TargetColor
+                                     || GetMinDistance(source, sourceCell, receiver) > maxAllowedDist;
+
+                if (shouldDisconnect)
                 {
                     source.Disconnect(receiver);
                     receiver.Disconnect();
                 }
             }
         }
-
-        if (obj.TryGetComponent(out GridSandReceiver receiverComp) && receiverComp.IsConnected)
-        {
-            if (!AreObjectsAdjacent(receiverComp.ConnectedSource.GridObject, receiverComp.GridObject))
-            {
-                BreakReceiverConnection(receiverComp);
-            }
-        }
-
-        if (_autoConnectOnPlaced)
-        {
-            EvaluateObjectConnections(obj);
-        }
     }
 
-    private void HandleObjectRemoved(GridObject obj)
+    /// <summary>
+    /// Searches for matching sources within _connectionRange around unconnected receivers and connects the closest one.
+    /// </summary>
+    public void EvaluatePendingConnections()
     {
-        HandleObjectPickup(obj);
-    }
-
-    [ContextMenu("Evaluate All Connections")]
-    public void EvaluateAllGridConnections()
-    {
+        GridSandReceiver[] receivers = FindObjectsByType<GridSandReceiver>(FindObjectsSortMode.None);
         GridSandSource[] sources = FindObjectsByType<GridSandSource>(FindObjectsSortMode.None);
-        for (int i = 0; i < sources.Length; i++)
+        float maxRangeDist = _connectionRange * GetCellStepMagnitude();
+
+        for (int r = 0; r < receivers.Length; r++)
         {
-            EvaluateSourceConnections(sources[i]);
+            GridSandReceiver receiver = receivers[r];
+            if (receiver.IsConnected || receiver.IsFull) continue;
+
+            GridSandSource bestSource = null;
+            Vector2Int bestSourceCell = Vector2Int.zero;
+            float minDistance = maxRangeDist;
+
+            for (int s = 0; s < sources.Length; s++)
+            {
+                GridSandSource source = sources[s];
+                if (!source.HasContent || source.CurrentColor != receiver.TargetColor) continue;
+
+                Vector2Int origin = source.GridObject.GridPosition;
+                foreach (var offset in source.GridObject.OccupiedOffsets)
+                {
+                    Vector2Int sourceCell = origin + offset;
+                    if (source.IsCellConnected(sourceCell)) continue;
+
+                    float dist = GetMinDistance(source, sourceCell, receiver);
+                    if (dist <= minDistance)
+                    {
+                        minDistance = dist;
+                        bestSource = source;
+                        bestSourceCell = sourceCell;
+                    }
+                }
+            }
+
+            if (bestSource != null)
+            {
+                EstablishConnection(bestSource, bestSourceCell, receiver);
+            }
         }
     }
 
     public void EvaluateObjectConnections(GridObject obj)
     {
-        if (obj.TryGetComponent(out GridSandSource source))
-        {
-            EvaluateSourceConnections(source);
-            return;
-        }
-
-        if (obj.TryGetComponent(out GridSandReceiver receiver) && !receiver.IsConnected)
-        {
-            EvaluateReceiverConnections(receiver);
-        }
+        EvaluateAllGridConnections();
     }
 
     public void EvaluateSourceConnections(GridSandSource source)
     {
-        Vector2Int origin = source.GridObject.GridPosition;
-
-        foreach (var offset in source.GridObject.OccupiedOffsets)
-        {
-            Vector2Int sourceCell = origin + offset;
-            if (source.IsCellConnected(sourceCell)) continue;
-
-            for (int i = 0; i < CardinalOffsets.Length; i++)
-            {
-                Vector2Int neighborCell = sourceCell + CardinalOffsets[i];
-                GridObject neighborObj = GridManager.Instance.GetObjectAt(neighborCell);
-
-                if (!neighborObj || neighborObj == source.GridObject) continue;
-
-                if (neighborObj.TryGetComponent(out GridSandReceiver receiver) && !receiver.IsConnected && source.CanConnect(receiver) && receiver.CanConnect(source))
-                {
-                    EstablishConnection(source, sourceCell, receiver);
-                    break;
-                }
-            }
-        }
+        EvaluateAllGridConnections();
     }
 
     public void EvaluateReceiverConnections(GridSandReceiver receiver)
     {
-        if (receiver.IsConnected) return;
+        EvaluateAllGridConnections();
+    }
 
-        Vector2Int origin = receiver.GridObject.GridPosition;
+    public float GetMinDistance(GridSandSource source, Vector2Int sourceCell, GridSandReceiver receiver)
+    {
+        Vector3 sourceWorldPos = source.GridObject.GetCellWorldPosition(sourceCell);
+        Vector2Int receiverOrigin = receiver.GridObject.GridPosition;
+        float minDistance = float.MaxValue;
 
         foreach (var offset in receiver.GridObject.OccupiedOffsets)
         {
-            Vector2Int receiverCell = origin + offset;
-
-            for (int i = 0; i < CardinalOffsets.Length; i++)
+            Vector2Int receiverCell = receiverOrigin + offset;
+            Vector3 receiverWorldPos = receiver.GridObject.GetCellWorldPosition(receiverCell);
+            float dist = Vector2.Distance(sourceWorldPos, receiverWorldPos);
+            if (dist < minDistance)
             {
-                Vector2Int neighborCell = receiverCell + CardinalOffsets[i];
-                GridObject neighborObj = GridManager.Instance.GetObjectAt(neighborCell);
-
-                if (!neighborObj || neighborObj == receiver.GridObject) continue;
-
-                if (neighborObj.TryGetComponent(out GridSandSource source) && !source.IsCellConnected(neighborCell) && source.CanConnect(receiver) && receiver.CanConnect(source))
-                {
-                    EstablishConnection(source, neighborCell, receiver);
-                    return;
-                }
+                minDistance = dist;
             }
         }
+
+        return minDistance;
     }
 
-    public bool IsCellAdjacentToObject(Vector2Int cell, GridObject obj)
+    private float GetCellStepMagnitude()
     {
-        Vector2Int origin = obj.GridPosition;
-
-        foreach (var offset in obj.OccupiedOffsets)
-        {
-            Vector2Int objCell = origin + offset;
-            for (int i = 0; i < CardinalOffsets.Length; i++)
-            {
-                if (objCell + CardinalOffsets[i] == cell)
-                    return true;
-            }
-        }
-
-        return false;
-    }
-
-    public bool AreObjectsAdjacent(GridObject a, GridObject b)
-    {
-        Vector2Int originA = a.GridPosition;
-        Vector2Int originB = b.GridPosition;
-
-        foreach (var offA in a.OccupiedOffsets)
-        {
-            Vector2Int cellA = originA + offA;
-            foreach (var offB in b.OccupiedOffsets)
-            {
-                Vector2Int cellB = originB + offB;
-                for (int i = 0; i < CardinalOffsets.Length; i++)
-                {
-                    if (cellA + CardinalOffsets[i] == cellB)
-                        return true;
-                }
-            }
-        }
-
-        return false;
+        GridManager gm = GridManager.Instance;
+        return gm != null ? gm.CellSize.x : 1f;
     }
 
     private void EstablishConnection(GridSandSource source, Vector2Int sourceCell, GridSandReceiver receiver)
     {
         source.Connect(sourceCell, receiver);
         receiver.Connect(source);
-        Debug.Log($"[GridSandConnector] Connected Source '{source.name}' at cell {sourceCell} ---> Receiver '{receiver.name}'");
     }
 
     private void BreakReceiverConnection(GridSandReceiver receiver)
     {
         GridSandSource source = receiver.ConnectedSource;
         receiver.Disconnect();
-        source.Disconnect(receiver);
-        Debug.Log($"[GridSandConnector] Disconnected Receiver '{receiver.name}'");
+        if (source != null)
+        {
+            source.Disconnect(receiver);
+        }
     }
 
     private void OnDrawGizmos()
     {
-        GridSandSource[] sources = FindObjectsByType<GridSandSource>(FindObjectsSortMode.None);
-        foreach (var source in sources)
+        float cellSize = GetCellStepMagnitude();
+        float rangeWorld = _connectionRange * cellSize;
+
+        // Draw detection radii around receivers
+        GridSandReceiver[] receivers = FindObjectsByType<GridSandReceiver>(FindObjectsSortMode.None);
+        for (int i = 0; i < receivers.Length; i++)
         {
+            GridSandReceiver r = receivers[i];
+            Vector3 center = r.GridObject != null
+                ? r.GridObject.GetCellWorldPosition(r.GridObject.GridPosition)
+                : r.transform.position;
+
+            Color gizmoColor = r.TargetColor != null ? r.TargetColor.Get(0) : Color.cyan;
+            Gizmos.color = new Color(gizmoColor.r, gizmoColor.g, gizmoColor.b, 0.25f);
+            Gizmos.DrawWireSphere(center, rangeWorld);
+        }
+
+        // Draw active connections
+        GridSandSource[] sources = FindObjectsByType<GridSandSource>(FindObjectsSortMode.None);
+        for (int i = 0; i < sources.Length; i++)
+        {
+            GridSandSource source = sources[i];
             if (!source.HasActiveConnections) continue;
 
             foreach (var pair in source.ActiveConnections)
@@ -276,16 +238,17 @@ public class GridSandConnector : MonoBehaviour
                 Vector2Int sourceCell = pair.Key;
                 GridSandReceiver receiver = pair.Value;
 
-                // World center of the source cell
-                Vector3 fromWorld = GridManager.Instance.CellToWorldPosition(sourceCell);
-                // World center of the receiver's pivot cell
-                Vector3 toWorld = GridManager.Instance.CellToWorldPosition(receiver.GridObject.GridPosition);
+                Vector3 fromWorld = source.GridObject != null
+                    ? source.GridObject.GetCellWorldPosition(sourceCell)
+                    : source.transform.position;
 
-                // Draw connection line
+                Vector3 toWorld = receiver.GridObject != null
+                    ? receiver.GridObject.GetCellWorldPosition(receiver.GridObject.GridPosition)
+                    : receiver.transform.position;
+
                 Gizmos.color = Color.yellow;
                 Gizmos.DrawLine(fromWorld, toWorld);
 
-                // Draw endpoints
                 Gizmos.color = Color.cyan;
                 Gizmos.DrawSphere(fromWorld, 0.08f);
                 Gizmos.color = Color.green;

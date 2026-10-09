@@ -6,6 +6,8 @@
 #pragma kernel Extract
 #pragma kernel Inject
 #pragma kernel FillReceiver
+#pragma kernel Drain
+#pragma kernel ClearType
 
 // Mỗi ô là 1 uint:  bit 0-3 = loại cát (0 = trống, 1..15)
 //                   bit 4-6 = sắc độ (shade 0..7) trong cùng 1 loại
@@ -42,6 +44,11 @@ RWStructuredBuffer<int> PortCounter; // [0] = count, [1] = capacity
 // ---- Receiver Fill by Percentage ----
 int TargetRow;
 uint FillType;
+
+// ---- Drain by Quota & Clear Type ----
+int DrainType;
+int ClearTargetType;
+RWStructuredBuffer<int> DrainCounter;
 
 uint Hash(uint x)
 {
@@ -289,5 +296,57 @@ void FillReceiver(uint3 id : SV_DispatchThreadID)
             uint shade = Hash(id.x * 73856093u ^ (uint)y * 19349663u) % SHADES;
             Current[index] = (FillType & 15u) | (shade << 4);
         }
+    }
+}
+
+[numthreads(64, 1, 1)]
+void Drain(uint3 id : SV_DispatchThreadID)
+{
+    int lane = (int)id.x;
+    if (lane >= PortLanes)
+        return;
+
+    for (int d = 0; d < PortHeight; d++)
+    {
+        if (DrainCounter[0] <= 0)
+            return;
+
+        int x, y;
+        if (!PortCell(lane, d, x, y))
+            break;
+
+        uint idx = (uint)y * Width + (uint)x;
+        uint v = Current[idx];
+        if (v != 0)
+        {
+            if (DrainType > 0 && (int)(v & 15u) != DrainType)
+                continue;
+
+            int prev;
+            InterlockedAdd(DrainCounter[0], -1, prev);
+            if (prev > 0)
+            {
+                Current[idx] = 0;
+                InterlockedAdd(DrainCounter[1], 1);
+            }
+            else
+            {
+                return;
+            }
+        }
+    }
+}
+
+[numthreads(8, 8, 1)]
+void ClearType(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x >= Width || (int)id.y >= Height)
+        return;
+
+    uint idx = id.y * Width + id.x;
+    if (ClearTargetType <= 0 || (int)(Current[idx] & 15u) == ClearTargetType)
+    {
+        Current[idx] = 0;
+        Next[idx] = 0;
     }
 }

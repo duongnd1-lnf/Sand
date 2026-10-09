@@ -1,166 +1,465 @@
+using System;
 using System.Collections.Generic;
 using UnityEngine;
 
 /// <summary>
-/// Visual bridge between GridSandSource (data) and a flow effect shown in the scene.
-/// Attach to the same GameObject as GridSandSource.
-/// For each active cell connection, spawns a Quad "sand stream" GameObject from the
-/// source cell world-center to the receiver's pivot cell world-center.
-/// The stream is destroyed when the connection is broken.
+/// Handles rendering, compute shader sand simulation, and visual stream particles for a GridSandSource.
+/// Inherits from SandPool to execute compute shaders (Sand.compute) and render to a RenderTexture Quad.
 /// </summary>
-public class GridSandSourceVisual : MonoBehaviour
+public class GridSandSourceVisual : SandPool
 {
-    [Header("Stream Visual")]
-    [SerializeField] private Material _streamMaterial;
-    [SerializeField] private Color _streamColor = new Color(0.85f, 0.65f, 0.2f, 1f);
-    [SerializeField] private float _streamWidth = 0.15f;
+    private int _kDrain = -1;
+    private int _kClearType = -1;
+    private ComputeBuffer _drainCounterBuffer;
+    private readonly int[] _drainCounterData = new int[2];
+
+    private readonly Dictionary<Vector2Int, ParticleSystem> _cellToParticles = new Dictionary<Vector2Int, ParticleSystem>();
+    private static Texture2D _circleTex;
 
     private GridSandSource _source;
-    // sourceCell -> stream quad GameObject
-    private readonly Dictionary<Vector2Int, GameObject> _activeStreams = new Dictionary<Vector2Int, GameObject>();
+
+    public void BindSource(GridSandSource source)
+    {
+        _source = source;
+    }
 
     private void Awake()
     {
-        _source = GetComponent<GridSandSource>();
-    }
-
-    private void OnEnable()
-    {
-        _source.OnCellConnected += HandleCellConnected;
-        _source.OnCellDisconnected += HandleCellDisconnected;
-        _source.OnDisconnected += HandleAllDisconnected;
-    }
-
-    private void OnDisable()
-    {
-        _source.OnCellConnected -= HandleCellConnected;
-        _source.OnCellDisconnected -= HandleCellDisconnected;
-        _source.OnDisconnected -= HandleAllDisconnected;
-    }
-
-    private void HandleCellConnected(Vector2Int sourceCell, GridSandReceiver receiver)
-    {
-        if (_activeStreams.ContainsKey(sourceCell)) return;
-
-        Vector3 from = GridManager.Instance.CellToWorldPosition(sourceCell);
-        Vector3 to = GridManager.Instance.CellToWorldPosition(receiver.GridObject.GridPosition);
-
-        GameObject stream = CreateStream(from, to);
-        _activeStreams[sourceCell] = stream;
-    }
-
-    private void HandleCellDisconnected(Vector2Int sourceCell, GridSandReceiver receiver)
-    {
-        DestroyStream(sourceCell);
-    }
-
-    private void HandleAllDisconnected()
-    {
-        foreach (var key in new List<Vector2Int>(_activeStreams.Keys))
+        if (_source == null)
         {
-            DestroyStream(key);
+            _source = GetComponent<GridSandSource>();
         }
     }
 
-    private void DestroyStream(Vector2Int sourceCell)
+    protected override void Start()
     {
-        if (_activeStreams.TryGetValue(sourceCell, out GameObject go))
+        EnsureReferences();
+        base.Start();
+    }
+
+    public void EnsureReferences()
+    {
+        if (target == null)
         {
-            if (go != null) Destroy(go);
-            _activeStreams.Remove(sourceCell);
+            target = GetComponentInChildren<MeshRenderer>();
+        }
+
+        if (target != null && (target.sharedMaterial == null || target.sharedMaterial.shader.name == "Universal Render Pipeline/Lit"))
+        {
+            Shader unlit = Shader.Find("Universal Render Pipeline/2D/Sprite-Unlit")
+                        ?? Shader.Find("Sprites/Default")
+                        ?? Shader.Find("Universal Render Pipeline/Unlit");
+            if (unlit != null)
+            {
+                target.material = new Material(unlit);
+            }
+        }
+
+#if UNITY_EDITOR
+        if (shader == null)
+        {
+            shader = UnityEditor.AssetDatabase.LoadAssetAtPath<ComputeShader>("Assets/Sand.compute");
+        }
+        if (palette == null)
+        {
+            palette = UnityEditor.AssetDatabase.LoadAssetAtPath<SandPalette>("Assets/Data/palette.asset");
+        }
+#endif
+    }
+
+#if UNITY_EDITOR
+    private void Reset()
+    {
+        EnsureReferences();
+    }
+
+    private void OnValidate()
+    {
+        EnsureReferences();
+    }
+#endif
+
+    protected override void OnPoolInitialized()
+    {
+        _kDrain = shader.FindKernel("Drain");
+        _kClearType = shader.FindKernel("ClearType");
+        _drainCounterBuffer?.Release();
+        _drainCounterBuffer = new ComputeBuffer(2, sizeof(int));
+
+        if (_source != null && _source.Layers != null && _source.Layers.Count > 0)
+        {
+            InitializeSandLayers(_source.Layers, _source.TopToBottom);
         }
     }
 
-    private void LateUpdate()
+    public void InitializeSandLayers(IReadOnlyList<GridSandSource.SandLayer> layers, bool topToBottom)
     {
-        // Keep stream positions updated in case objects move during drag
-        foreach (var pair in _activeStreams)
+        if (current == null || layers == null || layers.Count == 0) return;
+
+        int totalPixels = width * height;
+        uint[] data = new uint[totalPixels];
+
+        Vector4[] pal = palette != null ? palette.Build() : new Vector4[16 * SandPalette.Shades];
+        for (int i = 0; i < layers.Count && i < 15; i++)
         {
-            Vector2Int sourceCell = pair.Key;
-            GameObject stream = pair.Value;
-            if (stream == null) continue;
-
-            if (!_source.IsCellConnected(sourceCell)) continue;
-
-            if (!_source.ActiveConnections.TryGetValue(sourceCell, out GridSandReceiver receiver)) continue;
-
-            Vector3 from = GridManager.Instance.CellToWorldPosition(sourceCell);
-            Vector3 to = GridManager.Instance.CellToWorldPosition(receiver.GridObject.GridPosition);
-
-            PositionStream(stream, from, to);
+            int tid = i + 1;
+            layers[i].typeId = tid;
+            if (layers[i].color != null)
+            {
+                for (int s = 0; s < SandPalette.Shades; s++)
+                {
+                    pal[tid * SandPalette.Shades + s] = layers[i].color.Get(s);
+                }
+            }
         }
+        shader.SetVectorArray("Palette", pal);
+
+        int totalAmount = 0;
+        for (int i = 0; i < layers.Count; i++) totalAmount += layers[i].amount;
+        if (totalAmount <= 0) totalAmount = layers.Count * 100;
+
+        int currentRow = topToBottom ? height - 1 : 0;
+        int currentCol = 0;
+
+        for (int i = 0; i < layers.Count; i++)
+        {
+            GridSandSource.SandLayer layer = layers[i];
+            if (layer == null) continue;
+
+            int count;
+            if (i == layers.Count - 1)
+            {
+                count = topToBottom
+                    ? (currentRow + 1) * width - currentCol
+                    : (height - currentRow) * width - currentCol;
+            }
+            else
+            {
+                float ratio = (float)layer.amount / totalAmount;
+                count = Mathf.RoundToInt(ratio * totalPixels);
+            }
+
+            layer.initialAmount = Mathf.Max(1, layer.amount);
+            layer.initialPixels = count;
+            int resolvedType = layer.typeId;
+
+            for (int p = 0; p < count; p++)
+            {
+                if (topToBottom && currentRow < 0) break;
+                if (!topToBottom && currentRow >= height) break;
+
+                uint shade = (uint)UnityEngine.Random.Range(0, SandPalette.Shades);
+                uint pixelValue = (uint)resolvedType | (shade << 4);
+
+                data[currentRow * width + currentCol] = pixelValue;
+
+                currentCol++;
+                if (currentCol >= width)
+                {
+                    currentCol = 0;
+                    if (topToBottom) currentRow--;
+                    else currentRow++;
+                }
+            }
+        }
+
+        current.SetData(data);
+        next.SetData(data);
+        RenderTextureUpdate();
     }
 
-    private GameObject CreateStream(Vector3 from, Vector3 to)
+    public int DrainHole(Vector2Int sourceCell, GridSandReceiver receiver, int maxBudget, int sandType, GridObject gridObj)
     {
-        GameObject go = GameObject.CreatePrimitive(PrimitiveType.Quad);
-        go.name = "SandStream";
+        if (maxBudget <= 0 || current == null) return 0;
 
-        // Remove collider so it doesn't interfere with drag
-        Collider col = go.GetComponent<Collider>();
-        if (col != null) Destroy(col);
+        GetPortParameters(sourceCell, receiver, gridObj, out Side side, out int offset, out int lanes);
 
-        // Set parent so it follows the scene
-        go.transform.SetParent(transform.parent, true);
+        if (_kDrain < 0) _kDrain = shader.FindKernel("Drain");
+        if (_drainCounterBuffer == null) _drainCounterBuffer = new ComputeBuffer(2, sizeof(int));
 
-        // Apply material / color
-        MeshRenderer mr = go.GetComponent<MeshRenderer>();
-        if (_streamMaterial != null)
+        _drainCounterData[0] = maxBudget;
+        _drainCounterData[1] = 0;
+        _drainCounterBuffer.SetData(_drainCounterData);
+
+        shader.SetInt("PortSide", (int)side);
+        shader.SetInt("PortOffset", offset);
+        shader.SetInt("PortLanes", lanes);
+        shader.SetInt("PortFlip", 0);
+        shader.SetInt("PortHeight", side == Side.Bottom || side == Side.Top ? height : width);
+        shader.SetInt("DrainType", sandType);
+
+        shader.SetBuffer(_kDrain, "Current", current);
+        shader.SetBuffer(_kDrain, "DrainCounter", _drainCounterBuffer);
+
+        int groups = Mathf.CeilToInt(lanes / 64f);
+        shader.Dispatch(_kDrain, groups, 1, 1);
+
+        _drainCounterBuffer.GetData(_drainCounterData);
+        return _drainCounterData[1];
+    }
+
+    public void PurgeLayer(int sandType)
+    {
+        if (current == null) return;
+        if (_kClearType < 0) _kClearType = shader.FindKernel("ClearType");
+
+        shader.SetInt("ClearTargetType", sandType);
+        shader.SetBuffer(_kClearType, "Current", current);
+        shader.SetBuffer(_kClearType, "Next", next);
+        shader.Dispatch(_kClearType, gx, gy, 1);
+
+        RenderTextureUpdate();
+    }
+
+    public void StepSimulation(int steps)
+    {
+        if (current == null) return;
+        for (int i = 0; i < steps; i++)
         {
-            mr.material = new Material(_streamMaterial);
+            Step();
+        }
+        RenderTextureUpdate();
+    }
+
+    private void GetPortParameters(Vector2Int sourceCell, GridSandReceiver receiver, GridObject gridObj, out Side side, out int offset, out int lanes)
+    {
+        Vector3 sourceWorld = gridObj.GetCellWorldPosition(sourceCell);
+        Vector3 receiverWorld = receiver.GridObject.GetCellWorldPosition(receiver.GridObject.GridPosition);
+        Vector3 diff = receiverWorld - sourceWorld;
+
+        if (Mathf.Abs(diff.x) > Mathf.Abs(diff.y))
+        {
+            side = diff.x < 0 ? Side.Left : Side.Right;
         }
         else
         {
-            Shader s = Shader.Find("Universal Render Pipeline/2D/Sprite-Unlit-Default")
-                     ?? Shader.Find("Sprites/Default")
-                     ?? Shader.Find("Universal Render Pipeline/Unlit");
-            if (s != null) mr.material = new Material(s);
+            side = diff.y < 0 ? Side.Bottom : Side.Top;
         }
 
-        mr.material.color = _streamColor;
+        int objSizeX = Mathf.Max(1, gridObj.Size.x);
+        int objSizeY = Mathf.Max(1, gridObj.Size.y);
+        Vector2Int localCell = sourceCell - gridObj.GridPosition;
 
-        // Sort above grid
-        SpriteRenderer reference = GetComponentInChildren<SpriteRenderer>();
-        if (reference != null)
+        if (side == Side.Bottom || side == Side.Top)
         {
-            mr.sortingLayerID = reference.sortingLayerID;
-            mr.sortingOrder = reference.sortingOrder + 1;
+            float cellWidth = (float)width / objSizeX;
+            float centerX = (localCell.x + 0.5f) * cellWidth;
+            lanes = Mathf.Clamp(Mathf.RoundToInt(cellWidth * 0.45f), 16, width);
+            offset = Mathf.Clamp(Mathf.RoundToInt(centerX - lanes * 0.5f), 0, width - lanes);
         }
-
-        PositionStream(go, from, to);
-        return go;
+        else
+        {
+            float cellHeight = (float)height / objSizeY;
+            float centerY = (localCell.y + 0.5f) * cellHeight;
+            lanes = Mathf.Clamp(Mathf.RoundToInt(cellHeight * 0.45f), 16, height);
+            offset = Mathf.Clamp(Mathf.RoundToInt(centerY - lanes * 0.5f), 0, height - lanes);
+        }
     }
 
-    private void PositionStream(GameObject go, Vector3 from, Vector3 to)
+    // ------------------------------------------------------------------
+    // Particle Stream Visuals
+    // ------------------------------------------------------------------
+
+    private static Texture2D GetCircleTexture()
     {
-        from.z = transform.position.z - 0.01f;
-        to.z = transform.position.z - 0.01f;
+        if (_circleTex != null) return _circleTex;
 
-        Vector3 dir = to - from;
-        float dist = dir.magnitude;
+        int size = 16;
+        _circleTex = new Texture2D(size, size, TextureFormat.RGBA32, false);
+        _circleTex.filterMode = FilterMode.Bilinear;
+        _circleTex.wrapMode = TextureWrapMode.Clamp;
 
-        if (dist < 0.001f)
+        float center = (size - 1) * 0.5f;
+        float radius = center;
+
+        for (int y = 0; y < size; y++)
         {
-            go.SetActive(false);
-            return;
+            for (int x = 0; x < size; x++)
+            {
+                float dx = x - center;
+                float dy = y - center;
+                float dist = Mathf.Sqrt(dx * dx + dy * dy);
+                float alpha = Mathf.Clamp01(1f - (dist - (radius - 1.5f)) / 1.5f);
+                _circleTex.SetPixel(x, y, new Color(1f, 1f, 1f, alpha));
+            }
         }
-
-        go.SetActive(true);
-
-        Vector3 center = (from + to) * 0.5f;
-        float angle = Mathf.Atan2(dir.y, dir.x) * Mathf.Rad2Deg;
-
-        go.transform.position = center;
-        go.transform.rotation = Quaternion.Euler(0f, 0f, angle);
-        go.transform.localScale = new Vector3(dist, _streamWidth, 1f);
+        _circleTex.Apply();
+        return _circleTex;
     }
 
-    private void OnDestroy()
+    public ParticleSystem CreateStream(Vector2Int sourceCell, GridSandReceiver receiver)
     {
-        foreach (var go in _activeStreams.Values)
+        GameObject go = new GameObject($"SandStream_{sourceCell}");
+        go.transform.SetParent(transform, true);
+
+        ParticleSystem ps = go.AddComponent<ParticleSystem>();
+
+        var main = ps.main;
+        main.loop = false;
+        main.playOnAwake = false;
+        main.simulationSpace = ParticleSystemSimulationSpace.World;
+        main.maxParticles = 5000;
+        main.stopAction = ParticleSystemStopAction.None;
+        main.scalingMode = ParticleSystemScalingMode.Hierarchy;
+        main.gravityModifier = 0f;
+
+        var emission = ps.emission;
+        emission.enabled = false;
+
+        var shape = ps.shape;
+        shape.enabled = false;
+
+        ParticleSystemRenderer psr = go.GetComponent<ParticleSystemRenderer>();
+        psr.renderMode = ParticleSystemRenderMode.Billboard;
+        psr.sortMode = ParticleSystemSortMode.Distance;
+
+        Shader particleShader = Shader.Find("Universal Render Pipeline/Particles/Unlit")
+                             ?? Shader.Find("Universal Render Pipeline/2D/Sprite-Unlit")
+                             ?? Shader.Find("Sprites/Default");
+        Material mat = new Material(particleShader);
+        Texture2D circle = GetCircleTexture();
+        if (mat.HasProperty("_BaseMap")) mat.SetTexture("_BaseMap", circle);
+        if (mat.HasProperty("_MainTex")) mat.SetTexture("_MainTex", circle);
+        psr.material = mat;
+
+        if (target != null)
         {
-            if (go != null) Destroy(go);
+            psr.sortingLayerID = target.sortingLayerID;
+            psr.sortingOrder = target.sortingOrder + 10;
         }
-        _activeStreams.Clear();
+
+        _cellToParticles[sourceCell] = ps;
+        return ps;
+    }
+
+    public void DestroyStream(Vector2Int sourceCell)
+    {
+        if (_cellToParticles.TryGetValue(sourceCell, out ParticleSystem ps))
+        {
+            _cellToParticles.Remove(sourceCell);
+            if (ps != null)
+            {
+                Destroy(ps.gameObject, 0.5f);
+            }
+        }
+    }
+
+    public void DestroyAllStreams()
+    {
+        foreach (var ps in _cellToParticles.Values)
+        {
+            if (ps != null)
+            {
+                Destroy(ps.gameObject, 0.5f);
+            }
+        }
+        _cellToParticles.Clear();
+    }
+
+    public void EmitStreamParticles(Vector2Int sourceCell, GridSandReceiver receiver, int pixelCount, SandColor color)
+    {
+        if (pixelCount <= 0) return;
+        if (!_cellToParticles.TryGetValue(sourceCell, out ParticleSystem ps) || ps == null) return;
+
+        if (!ps.isPlaying) ps.Play();
+
+        GridManager gm = GridManager.Instance;
+        float cellSize = gm != null ? gm.CellSize.x : 1f;
+
+        Vector2Int targetCell = GetNearestReceiverCell(sourceCell, receiver);
+        Vector3 targetCenter = receiver.GridObject.GetCellWorldPosition(targetCell);
+        Vector3 spawnCenter = GetStreamSpawnPosition(sourceCell, targetCenter, cellSize);
+
+        Vector3 toTarget = targetCenter - spawnCenter;
+        bool isVertical = Mathf.Abs(toTarget.y) > Mathf.Abs(toTarget.x);
+
+        int particleCount = Mathf.Clamp(Mathf.RoundToInt(pixelCount * 0.4f), 1, 40);
+
+        ParticleSystem.EmitParams emitParams = new ParticleSystem.EmitParams();
+
+        for (int i = 0; i < particleCount; i++)
+        {
+            Vector3 spawnOffset;
+            if (isVertical)
+            {
+                float ox = UnityEngine.Random.Range(-cellSize * 0.15f, cellSize * 0.15f);
+                float oy = UnityEngine.Random.Range(-0.02f, 0.02f);
+                spawnOffset = new Vector3(ox, oy, 0f);
+            }
+            else
+            {
+                float ox = UnityEngine.Random.Range(-0.02f, 0.02f);
+                float oy = UnityEngine.Random.Range(-cellSize * 0.15f, cellSize * 0.15f);
+                spawnOffset = new Vector3(ox, oy, 0f);
+            }
+
+            Vector3 spawnPos = spawnCenter + spawnOffset;
+            spawnPos.z = transform.position.z - 0.05f;
+
+            Vector3 targetJitter = new Vector3(
+                UnityEngine.Random.Range(-cellSize * 0.12f, cellSize * 0.12f),
+                UnityEngine.Random.Range(-cellSize * 0.12f, cellSize * 0.12f),
+                0f
+            );
+            Vector3 endPoint = targetCenter + targetJitter;
+            endPoint.z = transform.position.z - 0.05f;
+
+            Vector3 displacement = endPoint - spawnPos;
+            float distance = displacement.magnitude;
+            float travelTime = Mathf.Clamp(distance / 4.0f, 0.2f, 0.5f);
+            travelTime += UnityEngine.Random.Range(-0.03f, 0.03f);
+
+            emitParams.position = spawnPos;
+            emitParams.velocity = displacement / travelTime;
+            emitParams.startLifetime = travelTime;
+            emitParams.startSize = UnityEngine.Random.Range(0.04f, 0.065f) * cellSize;
+
+            int shade = UnityEngine.Random.Range(0, SandPalette.Shades);
+            emitParams.startColor = color != null ? color.Get(shade) : Color.yellow;
+
+            ps.Emit(emitParams, 1);
+        }
+    }
+
+    private Vector2Int GetNearestReceiverCell(Vector2Int sourceCell, GridSandReceiver receiver)
+    {
+        if (receiver.GridObject.OccupiedOffsets == null || receiver.GridObject.OccupiedOffsets.Count <= 1)
+        {
+            return receiver.GridObject.GridPosition;
+        }
+
+        Vector2Int origin = receiver.GridObject.GridPosition;
+        Vector2Int nearest = origin;
+        float minSqrDist = float.MaxValue;
+        Vector3 sourceWorld = _source.GridObject.GetCellWorldPosition(sourceCell);
+
+        foreach (var offset in receiver.GridObject.OccupiedOffsets)
+        {
+            Vector2Int candidate = origin + offset;
+            Vector3 candidateWorld = receiver.GridObject.GetCellWorldPosition(candidate);
+            float sqrDist = (candidateWorld - sourceWorld).sqrMagnitude;
+            if (sqrDist < minSqrDist)
+            {
+                minSqrDist = sqrDist;
+                nearest = candidate;
+            }
+        }
+
+        return nearest;
+    }
+
+    private Vector3 GetStreamSpawnPosition(Vector2Int sourceCell, Vector3 targetCenter, float cellSize)
+    {
+        Vector3 cellCenter = _source.GridObject.GetCellWorldPosition(sourceCell);
+        Vector3 dir = (targetCenter - cellCenter).normalized;
+        return cellCenter + dir * (cellSize * 0.45f);
+    }
+
+    protected override void OnDestroy()
+    {
+        DestroyAllStreams();
+        _drainCounterBuffer?.Release();
+        base.OnDestroy();
+        if (shader != null) Destroy(shader);
     }
 }
