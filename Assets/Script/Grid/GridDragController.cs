@@ -37,7 +37,7 @@ public class GridDragController : MonoBehaviour
     {
         if (_gridManager == null)
         {
-            _gridManager = GridManager.Instance != null ? GridManager.Instance : FindFirstObjectByType<GridManager>();
+            _gridManager = GridManager.Instance;
         }
         if (_camera == null)
         {

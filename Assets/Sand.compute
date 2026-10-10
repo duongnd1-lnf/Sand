@@ -1,192 +1,111 @@
-#pragma kernel Clear
-#pragma kernel ClearNext
-#pragma kernel AddSand
+#pragma kernel ClearAll
+#pragma kernel ClearClaims
 #pragma kernel Simulate
 #pragma kernel Render
-#pragma kernel Extract
-#pragma kernel Inject
-#pragma kernel FillReceiver
-#pragma kernel Drain
-#pragma kernel ClearType
-#pragma kernel ProbeSand
+#pragma kernel Erase
 
-// Mỗi ô là 1 uint:  bit 0-3 = loại cát (0 = trống, 1..15)
-//                   bit 4-6 = sắc độ (shade 0..7) trong cùng 1 loại
-// Hạt di chuyển thì chép nguyên cả uint nên màu đi theo hạt.
 #define SHADES 8
 
+// Current frame data (read-only during simulation)
 RWStructuredBuffer<uint> Current;
+// Next frame data (write target)
 RWStructuredBuffer<uint> Next;
-RWTexture2D<float4> Result;
+// Atomic claim buffer: 0 = unclaimed, 1 = claimed
+RWStructuredBuffer<uint> Claims;
 
-float4 Palette[16 * SHADES];   // Palette[type * SHADES + shade]; type 0 = trong suốt
+RWTexture2D<float4> Result;
+float4 Palette[16 * SHADES];
 
 int Width;
 int Height;
-int BrushX;
-int BrushY;
-int BrushRadius;
-int BrushType;        // 0 = cục tẩy, 1..15 = loại cát
-int BrushTypeDel;     // loại bị tẩy khi BrushType == 0; số âm = tẩy tất cả
 int Frame;
 
-// ---- Cổng nối với ống ----
-RWStructuredBuffer<uint> PipeBuf;   // [lane * PipeLength + p], p = 0 là đầu ống (phía nguồn)
-int PipeLength;
-int PortSide;    // 0 = đáy, 1 = đỉnh, 2 = trái, 3 = phải
-int PortOffset;  // vị trí ô đầu tiên của cổng dọc theo cạnh
-int PortLanes;   // số ô của cổng = số lane của ống
-int PortFlip;    // 1 = đảo chiều lane so với chiều tăng dần dọc cạnh
-int PortHeight;  // bề dày (pixel) tầng được phép lấy, tính từ cạnh vào trong
-int PortAcceptType; // 0 = accept any, 1..15 = only accept this sand type (for Inject)
-int PortFilterType; // 0 = extract any, 1..15 = only extract this sand type (for Extract)
-RWStructuredBuffer<int> PortCounter; // [0] = count, [1] = capacity
+int EraseXMin;
+int EraseXMax;
+int EraseYMin;
+int EraseYMax;
+int EraseType;
 
-// ---- Receiver Fill by Percentage ----
-int TargetRow;
-uint FillType;
-
-// ---- Drain by Quota & Clear Type ----
-int DrainType;
-int ClearTargetType;
-RWStructuredBuffer<int> DrainCounter;
-
-// ---- Probe Sand in Rect / Cell ----
-int ProbeXMin;
-int ProbeXMax;
-int ProbeYMin;
-int ProbeYMax;
-int ProbeTargetType;
-RWStructuredBuffer<int> ProbeCounter;
-
-uint Hash(uint x)
+// Atomically claim a cell. Returns true if this thread was first to claim it.
+bool AtomicClaim(int x, int y)
 {
-    x ^= x >> 16; x *= 0x7feb352du;
-    x ^= x >> 15; x *= 0x846ca68bu;
-    x ^= x >> 16;
-    return x;
+    uint index = (uint)y * Width + (uint)x;
+    uint previous;
+    InterlockedCompareExchange(Claims[index], 0u, 1u, previous);
+    return previous == 0u;
 }
 
 [numthreads(8, 8, 1)]
-void Clear(uint3 id : SV_DispatchThreadID)
+void ClearAll(uint3 id : SV_DispatchThreadID)
 {
     if ((int)id.x >= Width || (int)id.y >= Height)
         return;
 
     uint index = id.y * Width + id.x;
-    Current[index] = 0;
-    Next[index] = 0;
+    Current[index] = 0u;
+    Next[index]    = 0u;
+    Claims[index]  = 0u;
 }
 
 [numthreads(8, 8, 1)]
-void ClearNext(uint3 id : SV_DispatchThreadID)
+void ClearClaims(uint3 id : SV_DispatchThreadID)
 {
     if ((int)id.x >= Width || (int)id.y >= Height)
         return;
 
-    Next[id.y * Width + id.x] = 0;
-}
-
-[numthreads(8, 8, 1)]
-void AddSand(uint3 id : SV_DispatchThreadID)
-{
-    if ((int)id.x >= Width || (int)id.y >= Height)
-        return;
-
-    int dx = (int)id.x - BrushX;
-    int dy = (int)id.y - BrushY;
-
-    if (dx * dx + dy * dy > BrushRadius * BrushRadius)
-        return;
-
-    uint index = id.y * Width + id.x;
-    uint value = Current[index];
-
-    if (BrushType == 0)
-    {
-        // Tẩy: tất cả (BrushTypeDel < 0) hoặc chỉ 1 loại
-        if (BrushTypeDel < 0 || (value & 15u) == (uint)BrushTypeDel)
-            Current[index] = 0;
-    }
-    else if (value == 0)
-    {
-        // Mỗi hạt mới nhận 1 sắc độ ngẫu nhiên, cố định suốt đời hạt
-        uint shade = Hash(id.x * 73856093u ^ id.y * 19349663u ^ (uint)Frame * 83492791u) % SHADES;
-        Current[index] = (uint)BrushType | (shade << 4);
-    }
+    Claims[id.y * Width + id.x] = 0u;
 }
 
 [numthreads(8, 8, 1)]
 void Simulate(uint3 id : SV_DispatchThreadID)
 {
-    if ((int)id.x >= Width || (int)id.y >= Height)
-        return;
-
-    uint index = id.y * Width + id.x;
-    uint value = Current[index];
-
-    if ((value & 15u) == 0)
-        return;
-
     int x = (int)id.x;
     int y = (int)id.y;
 
-    int targetX = x;
-    int targetY = y;
-    bool moved = false;
+    // Border cells stay still (matches reference: id.y <= 0 || id.y >= Height || id.x <= 0 || id.x >= Width-1)
+    if (x <= 0 || x >= Width - 1 || y <= 0 || y >= Height)
+        return;
 
-    if (y > 0)
+    uint index = (uint)y * Width + (uint)x;
+    uint value = Current[index];
+
+    // Empty cell - nothing to do
+    if ((value & 15u) == 0u)
+        return;
+
+    bool oddFrame = (Frame & 1) == 1;
+
+    // Alternate diagonal preference each frame
+    int2 down       = int2(x,     y - 1);
+    int2 diagFirst  = oddFrame ? int2(x + 1, y - 1) : int2(x - 1, y - 1);
+    int2 diagSecond = oddFrame ? int2(x - 1, y - 1) : int2(x + 1, y - 1);
+
+    // Try straight down
+    if (Current[(uint)down.y * Width + (uint)down.x] == 0u && AtomicClaim(down.x, down.y))
     {
-        uint below = (uint)(y - 1) * Width + x;
-        if (Current[below] == 0)
-        {
-            targetY = y - 1;
-            moved = true;
-        }
-
-        if (!moved)
-        {
-            bool leftFirst = ((x + y + Frame) & 1) == 0;
-            int firstDir  = leftFirst ? -1 :  1;
-            int secondDir = leftFirst ?  1 : -1;
-
-            int fx = x + firstDir;
-            if (fx >= 0 && fx < Width)
-            {
-                uint i = (uint)(y - 1) * Width + fx;
-                if (Current[i] == 0)
-                {
-                    targetX = fx;
-                    targetY = y - 1;
-                    moved = true;
-                }
-            }
-
-            if (!moved)
-            {
-                int sx = x + secondDir;
-                if (sx >= 0 && sx < Width)
-                {
-                    uint i = (uint)(y - 1) * Width + sx;
-                    if (Current[i] == 0)
-                    {
-                        targetX = sx;
-                        targetY = y - 1;
-                        moved = true;
-                    }
-                }
-            }
-        }
+        Next[index]                                = 0u;
+        Next[(uint)down.y * Width + (uint)down.x] = value;
+        return;
     }
 
-    uint targetIndex = (uint)targetY * Width + targetX;
-    uint original;
-
-    InterlockedCompareExchange(Next[targetIndex], 0, value, original);
-
-    if (original != 0)
+    // Try first diagonal
+    if (diagFirst.x >= 0 && diagFirst.x < Width &&
+        Current[(uint)diagFirst.y * Width + (uint)diagFirst.x] == 0u &&
+        AtomicClaim(diagFirst.x, diagFirst.y))
     {
-        InterlockedCompareExchange(Next[index], 0, value, original);
+        Next[index] = 0u;
+        Next[(uint)diagFirst.y * Width + (uint)diagFirst.x] = value;
+        return;
+    }
+
+    // Try second diagonal
+    if (diagSecond.x >= 0 && diagSecond.x < Width &&
+        Current[(uint)diagSecond.y * Width + (uint)diagSecond.x] == 0u &&
+        AtomicClaim(diagSecond.x, diagSecond.y))
+    {
+        Next[index] = 0u;
+        Next[(uint)diagSecond.y * Width + (uint)diagSecond.x] = value;
+        return;
     }
 }
 
@@ -203,179 +122,20 @@ void Render(uint3 id : SV_DispatchThreadID)
     Result[id.xy] = Palette[type * SHADES + shade];
 }
 
-// Ô (x, y) của lane `lane` ở độ sâu d tính từ cạnh. Trả về false nếu nằm ngoài hồ.
-bool PortCell(int lane, int d, out int x, out int y)
-{
-    int l = (PortFlip != 0) ? (PortLanes - 1 - lane) : lane;
-    int a = PortOffset + l;
-
-    if (PortSide == 0)      { x = a;             y = d; }
-    else if (PortSide == 1) { x = a;             y = Height - 1 - d; }
-    else if (PortSide == 2) { x = d;             y = a; }
-    else                    { x = Width - 1 - d; y = a; }
-
-    return x >= 0 && x < Width && y >= 0 && y < Height;
-}
-
-// Mỗi lane lấy hạt gần cạnh nhất trong bề dày PortHeight, nhét vào ĐẦU ống.
-// Đầu ống đang có hạt thì không lấy (áp lực ngược).
-[numthreads(64, 1, 1)]
-void Extract(uint3 id : SV_DispatchThreadID)
-{
-    int lane = (int)id.x;
-    if (lane >= PortLanes)
-        return;
-
-    uint head = (uint)lane * (uint)PipeLength;
-    if (PipeBuf[head] != 0)
-        return;
-
-    for (int d = 0; d < PortHeight; d++)
-    {
-        int x, y;
-        if (!PortCell(lane, d, x, y))
-            break;
-
-        uint idx = (uint)y * Width + (uint)x;
-        uint v = Current[idx];
-        if (v != 0)
-        {
-            if (PortFilterType > 0 && (int)(v & 0xFu) != PortFilterType)
-                return;
-
-            PipeBuf[head] = v;
-            Current[idx] = 0;
-            return;
-        }
-    }
-}
-
-// Thả hạt CUỐI ống vào ô sát cạnh. Ô đó đang có cát (hồ đầy) thì hạt ở lại trong ống.
-[numthreads(64, 1, 1)]
-void Inject(uint3 id : SV_DispatchThreadID)
-{
-    int lane = (int)id.x;
-    if (lane >= PortLanes)
-        return;
-
-    int x, y;
-    if (!PortCell(lane, 0, x, y))
-        return;
-
-    uint tail = (uint)lane * (uint)PipeLength + (uint)(PipeLength - 1);
-    uint v = PipeBuf[tail];
-    if (v == 0)
-        return;
-
-    // Filter by accepted sand type
-    if (PortAcceptType > 0 && (int)(v & 0xFu) != PortAcceptType)
-        return;
-
-    // Capacity limit check
-    int prevCount;
-    InterlockedAdd(PortCounter[0], 1, prevCount);
-    if (prevCount >= PortCounter[1])
-    {
-        InterlockedAdd(PortCounter[0], -1);
-        return;
-    }
-
-    uint idx = (uint)y * Width + (uint)x;
-    if (Current[idx] == 0)
-    {
-        Current[idx] = v;
-    }
-    PipeBuf[tail] = 0;
-}
-
 [numthreads(8, 8, 1)]
-void FillReceiver(uint3 id : SV_DispatchThreadID)
+void Erase(uint3 id : SV_DispatchThreadID)
 {
-    if ((int)id.x >= Width || (int)id.y >= Height)
+    int x = EraseXMin + (int)id.x;
+    int y = EraseYMin + (int)id.y;
+
+    if (x > EraseXMax || y > EraseYMax || x < 0 || x >= Width || y < 0 || y >= Height)
         return;
 
-    int y = (int)id.y;
-    uint index = (uint)y * Width + id.x;
-
-    if (y < TargetRow)
+    uint index = (uint)y * Width + (uint)x;
+    uint val = Current[index];
+    if (val != 0u && (EraseType <= 0 || (int)(val & 15u) == EraseType))
     {
-        uint currentVal = Current[index];
-        if ((currentVal & 15u) != FillType)
-        {
-            uint shade = Hash(id.x * 73856093u ^ (uint)y * 19349663u) % SHADES;
-            Current[index] = (FillType & 15u) | (shade << 4);
-        }
-    }
-}
-
-[numthreads(64, 1, 1)]
-void Drain(uint3 id : SV_DispatchThreadID)
-{
-    int lane = (int)id.x;
-    if (lane >= PortLanes)
-        return;
-
-    for (int d = 0; d < PortHeight; d++)
-    {
-        if (DrainCounter[0] <= 0)
-            return;
-
-        int x, y;
-        if (!PortCell(lane, d, x, y))
-            break;
-
-        uint idx = (uint)y * Width + (uint)x;
-        uint v = Current[idx];
-        if (v != 0)
-        {
-            if (DrainType > 0 && (int)(v & 15u) != DrainType)
-                continue;
-
-            int prev;
-            InterlockedAdd(DrainCounter[0], -1, prev);
-            if (prev > 0)
-            {
-                Current[idx] = 0;
-                InterlockedAdd(DrainCounter[1], 1);
-            }
-            else
-            {
-                return;
-            }
-        }
-    }
-}
-
-[numthreads(8, 8, 1)]
-void ClearType(uint3 id : SV_DispatchThreadID)
-{
-    if ((int)id.x >= Width || (int)id.y >= Height)
-        return;
-
-    uint idx = id.y * Width + id.x;
-    if (ClearTargetType <= 0 || (int)(Current[idx] & 15u) == ClearTargetType)
-    {
-        Current[idx] = 0;
-        Next[idx] = 0;
-    }
-}
-
-[numthreads(8, 8, 1)]
-void ProbeSand(uint3 id : SV_DispatchThreadID)
-{
-    int x = ProbeXMin + (int)id.x;
-    int y = ProbeYMin + (int)id.y;
-
-    if (x >= ProbeXMax || y >= ProbeYMax || x >= Width || y >= Height)
-        return;
-
-    uint v = Current[(uint)y * Width + (uint)x];
-    if (v != 0)
-    {
-        int t = (int)(v & 15u);
-        if (ProbeTargetType <= 0 || t == ProbeTargetType)
-        {
-            InterlockedAdd(ProbeCounter[0], 1);
-        }
+        Current[index] = 0u;
+        Next[index]    = 0u;
     }
 }

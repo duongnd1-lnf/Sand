@@ -21,6 +21,10 @@ public abstract class GridObject : MonoBehaviour
     [SerializeField] private bool _isDraggable = true;
     [SerializeField] private Collider2D _collider2D;
 
+    [Header("Sand References")]
+    [SerializeField] private GridSandSource _source;
+    [SerializeField] private GridSandReceiver _receiver;
+
     [Header("Drag Visual Settings")]
     [SerializeField] private float _dragScaleMultiplier = 1.05f;
     [SerializeField] private float _snapDuration = 0.12f;
@@ -39,6 +43,11 @@ public abstract class GridObject : MonoBehaviour
     public GridManager Manager => GridManager.Instance;
     public Collider2D Collider2D => _collider2D;
 
+    public GridSandSource Source { get => _source; set => _source = value; }
+    public GridSandReceiver Receiver { get => _receiver; set => _receiver = value; }
+    public bool IsSource => _source != null;
+    public bool IsReceiver => _receiver != null;
+
     public abstract IReadOnlyList<Vector2Int> OccupiedOffsets { get; }
     public abstract Vector2Int Size { get; set; }
 
@@ -49,6 +58,8 @@ public abstract class GridObject : MonoBehaviour
     protected virtual void Awake()
     {
         _originalScale = transform.localScale;
+        if (_source == null) _source = GetComponent<GridSandSource>();
+        if (_receiver == null) _receiver = GetComponent<GridSandReceiver>();
     }
 
     protected virtual void Start()

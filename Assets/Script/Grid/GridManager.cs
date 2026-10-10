@@ -38,6 +38,7 @@ public class GridManager : MonoBehaviour
     public Vector2 CellGap => _cellGap;
 
     public IReadOnlyDictionary<Vector2Int, GridCellData> Cells => _cells;
+    public IEnumerable<GridObject> PlacedObjects => _objectFootprints.Keys;
 
     private void Awake()
     {

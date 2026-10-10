@@ -28,6 +28,6 @@ public class GridLevel : MonoBehaviour
             gm.TryPlaceObject(objects[i], cell, animate: false);
         }
 
-        FindFirstObjectByType<GridSandConnector>().EvaluateAllGridConnections();
+        GridSandConnector.Instance?.EvaluateAllGridConnections();
     }
 }

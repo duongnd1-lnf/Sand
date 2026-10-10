@@ -211,7 +211,7 @@ public class GridRenderer : MonoBehaviour
             instance.ApplyRotation(sourceConfig.rotation);
             instance.IsDraggable = sourceConfig.isDraggable;
 
-            GridSandSource sourceComp = instance.GetComponent<GridSandSource>();
+            GridSandSource sourceComp = instance.Source;
             sourceComp.InitializeLayers(sourceConfig.layers);
 
             gridManager.TryPlaceObject(instance, originCell, animate: false);
