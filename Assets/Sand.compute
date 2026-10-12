@@ -12,6 +12,8 @@ RWStructuredBuffer<uint> Current;
 RWStructuredBuffer<uint> Next;
 // Atomic claim buffer: 0 = unclaimed, 1 = claimed
 RWStructuredBuffer<uint> Claims;
+// Atomic counter buffer for counting erased particles
+RWStructuredBuffer<uint> ErasedCount;
 
 RWTexture2D<float4> Result;
 float4 Palette[16 * SHADES];
@@ -25,6 +27,7 @@ int EraseXMax;
 int EraseYMin;
 int EraseYMax;
 int EraseType;
+int EraseMaxCount;
 
 // Atomically claim a cell. Returns true if this thread was first to claim it.
 bool AtomicClaim(int x, int y)
@@ -62,8 +65,8 @@ void Simulate(uint3 id : SV_DispatchThreadID)
     int x = (int)id.x;
     int y = (int)id.y;
 
-    // Border cells stay still (matches reference: id.y <= 0 || id.y >= Height || id.x <= 0 || id.x >= Width-1)
-    if (x <= 0 || x >= Width - 1 || y <= 0 || y >= Height)
+    // Out of bounds or bottom/top borders
+    if (x < 0 || x >= Width || y <= 0 || y >= Height)
         return;
 
     uint index = (uint)y * Width + (uint)x;
@@ -80,17 +83,34 @@ void Simulate(uint3 id : SV_DispatchThreadID)
     int2 diagFirst  = oddFrame ? int2(x + 1, y - 1) : int2(x - 1, y - 1);
     int2 diagSecond = oddFrame ? int2(x - 1, y - 1) : int2(x + 1, y - 1);
 
-    // Try straight down
-    if (Current[(uint)down.y * Width + (uint)down.x] == 0u && AtomicClaim(down.x, down.y))
+    // Find the first empty cell directly below in this continuous column of sand
+    int emptyY = -1;
+    for (int checkY = y - 1; checkY >= 0; checkY--)
     {
-        Next[index]                                = 0u;
-        Next[(uint)down.y * Width + (uint)down.x] = value;
+        uint checkVal = Current[(uint)checkY * Width + (uint)x];
+        if (checkVal == 0u)
+        {
+            emptyY = checkY;
+            break;
+        }
+    }
+
+    // Continuous column fall: if an empty space exists below, the entire column drops by 1
+    if (emptyY != -1)
+    {
+        Next[(uint)(y - 1) * Width + (uint)x] = value;
+        uint aboveIndex = (uint)(y + 1) * Width + (uint)x;
+        if (y + 1 >= Height || Current[aboveIndex] == 0u)
+        {
+            Next[index] = 0u;
+        }
         return;
     }
 
-    // Try first diagonal
+    // Try first diagonal (only into cells that do not have sand directly above them)
     if (diagFirst.x >= 0 && diagFirst.x < Width &&
         Current[(uint)diagFirst.y * Width + (uint)diagFirst.x] == 0u &&
+        (diagFirst.y + 1 >= Height || Current[(uint)(diagFirst.y + 1) * Width + (uint)diagFirst.x] == 0u) &&
         AtomicClaim(diagFirst.x, diagFirst.y))
     {
         Next[index] = 0u;
@@ -98,9 +118,10 @@ void Simulate(uint3 id : SV_DispatchThreadID)
         return;
     }
 
-    // Try second diagonal
+    // Try second diagonal (only into cells that do not have sand directly above them)
     if (diagSecond.x >= 0 && diagSecond.x < Width &&
         Current[(uint)diagSecond.y * Width + (uint)diagSecond.x] == 0u &&
+        (diagSecond.y + 1 >= Height || Current[(uint)(diagSecond.y + 1) * Width + (uint)diagSecond.x] == 0u) &&
         AtomicClaim(diagSecond.x, diagSecond.y))
     {
         Next[index] = 0u;
@@ -133,9 +154,23 @@ void Erase(uint3 id : SV_DispatchThreadID)
 
     uint index = (uint)y * Width + (uint)x;
     uint val = Current[index];
-    if (val != 0u && (EraseType <= 0 || (int)(val & 15u) == EraseType))
+    if (val != 0u && (EraseType == 0 || (int)(val & 15u) == EraseType))
     {
-        Current[index] = 0u;
-        Next[index]    = 0u;
+        if (EraseMaxCount > 0)
+        {
+            uint originalCount;
+            InterlockedAdd(ErasedCount[0], 1u, originalCount);
+            if (originalCount < (uint)EraseMaxCount)
+            {
+                Current[index] = 0u;
+                Next[index]    = 0u;
+            }
+        }
+        else
+        {
+            Current[index] = 0u;
+            Next[index]    = 0u;
+            InterlockedAdd(ErasedCount[0], 1u);
+        }
     }
 }

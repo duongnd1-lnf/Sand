@@ -36,14 +36,21 @@ public class GridSandReceiver : MonoBehaviour
         if (_gridObject == null) _gridObject = GetComponent<GridObject>();
     }
 
-    private void OnDestroy()
+    private void Reset()
     {
-        Disconnect();
+        _gridObject = GetComponent<GridObject>();
     }
+
+    //private void OnDestroy()
+    //{
+    //    Disconnect();
+    //}
+
+    private bool _isClearing;
 
     public bool CanConnect(GridSandSource source)
     {
-        return !IsFull;
+        return !IsFull && !_isClearing;
     }
 
     public void Connect(GridSandSource source, List<GridConnectionPoint> connectionPoints)
@@ -88,11 +95,50 @@ public class GridSandReceiver : MonoBehaviour
 
     public void AddAmount(int amount)
     {
+        if (IsFull || _isClearing) return;
+
         _currentAmount = Mathf.Min(_capacity, _currentAmount + amount);
         if (IsFull)
         {
             OnFilled?.Invoke();
-            Disconnect();
+            PlayCompleteAndDestroyAnimation();
         }
+    }
+
+    /// <summary>
+    /// Animation sequence triggered when receiver is filled.
+    /// Removes the object from the grid and destroys the GameObject at the end of the animation.
+    /// </summary>
+    public void PlayCompleteAndDestroyAnimation()
+    {
+        if (_isClearing) return;
+        _isClearing = true;
+
+        Disconnect();
+
+        if (_gridObject != null && GridManager.Instance != null)
+        {
+            GridManager.Instance.RemoveObject(_gridObject);
+        }
+
+        StartCoroutine(CompleteAnimationRoutine());
+    }
+
+    private System.Collections.IEnumerator CompleteAnimationRoutine()
+    {
+        // Placeholder animation: scales down smoothly. Replace with custom animation when available.
+        float duration = 0.35f;
+        float elapsed = 0f;
+        Vector3 startScale = transform.localScale;
+
+        while (elapsed < duration)
+        {
+            elapsed += Time.deltaTime;
+            float t = Mathf.Clamp01(elapsed / duration);
+            transform.localScale = Vector3.Lerp(startScale, Vector3.zero, t);
+            yield return null;
+        }
+
+        Destroy(gameObject);
     }
 }

@@ -1784,9 +1784,10 @@ MonoBehaviour:
   - color: {fileID: 11400000, guid: cd89021d2fcfa8e4abb06b33eb551108, type: 2}
     amount: 100
   _sand: {fileID: 1359661426}
-  _drawGizmos: 1
+  depth: 2
   _gridObject: {fileID: 1025420995}
   _stepsPerFrame: 1
+  _drawGizmos: 1
 --- !u!114 &1025420995
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -2269,8 +2270,8 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: afc9e368360bd8c41a9ad11b90303298, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  _width: 256
-  _height: 256
+  _width: 20
+  _height: 20
   _shader: {fileID: 7200000, guid: 68e937c68bfce004784511ad15116da8, type: 3}
   _palette: {fileID: 11400000, guid: a066985c2fa1ad444992ad25e61dab80, type: 2}
   _target: {fileID: 1346170547}

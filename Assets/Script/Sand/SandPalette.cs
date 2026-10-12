@@ -23,4 +23,15 @@ public class SandPalette : ScriptableObject
     }
 
     public void Apply(ComputeShader cs) => cs.SetVectorArray("Palette", Build());
+
+    public int GetColorTypeId(SandColor color)
+    {
+        if (types == null || color == null) return -1;
+        for (int i = 0; i < TypeCount; i++)
+        {
+            if (types[i] == color || (types[i] != null && types[i].Id == color.Id))
+                return i + 1;
+        }
+        return -1;
+    }
 }

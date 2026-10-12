@@ -18,6 +18,8 @@ public class GridSand : MonoBehaviour
     private GraphicsBuffer _current;
     private GraphicsBuffer _next;
     private GraphicsBuffer _claims;
+    private GraphicsBuffer _eraseCountBuffer;
+    private readonly uint[] _eraseCountData = new uint[1];
     private RenderTexture _texture;
 
     private int _kClearAll;
@@ -96,6 +98,9 @@ public class GridSand : MonoBehaviour
         _current?.Release();
         _next?.Release();
         _claims?.Release();
+        _eraseCountBuffer?.Release();
+
+        _eraseCountBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, 1, sizeof(uint));
 
         GraphicsBuffer.Target simBufferTarget = GraphicsBuffer.Target.Structured | GraphicsBuffer.Target.CopySource | GraphicsBuffer.Target.CopyDestination;
         _current = new GraphicsBuffer(simBufferTarget, total, sizeof(uint));
@@ -126,37 +131,76 @@ public class GridSand : MonoBehaviour
     public void Init(IReadOnlyList<GridSandSource.SandLayer> layers)
     {
         if (layers.Count == 0) return;
-        Init(layers[0].color);
-    }
-
-    public void Init(SandColor color)
-    {
         if (_current == null) InitSimulation();
+
+        List<SandColor> distinctColors = new List<SandColor>();
+        for (int i = 0; i < layers.Count; i++)
+        {
+            if (layers[i].color != null && !distinctColors.Contains(layers[i].color))
+            {
+                distinctColors.Add(layers[i].color);
+            }
+        }
+
+        if (distinctColors.Count == 0) return;
 
         if (_palette == null)
             _palette = ScriptableObject.CreateInstance<SandPalette>();
         else
             _palette = Instantiate(_palette);
 
-        _palette.types = new[] { color };
+        _palette.types = distinctColors.ToArray();
         _palette.Apply(_shader);
+
+        int totalAmount = 0;
+        for (int i = 0; i < layers.Count; i++)
+            totalAmount += Mathf.Max(1, layers[i].amount);
 
         int total = _width * _height;
         uint[] initialData = new uint[total];
-        for (int y = 0; y < _height; y++)
+
+        int currentY = 0;
+        for (int i = 0; i < layers.Count; i++)
         {
-            for (int x = 0; x < _width; x++)
+            var layer = layers[i];
+            if (layer.color == null) continue;
+
+            int typeId = _palette.GetColorTypeId(layer.color);
+            if (typeId <= 0) continue;
+
+            int layerHeight;
+            if (i == layers.Count - 1)
             {
-                uint shade = (uint)((x * 7 + y * 13) & (SandPalette.Shades - 1));
-                initialData[y * _width + x] = 1u | (shade << 4);
+                layerHeight = _height - currentY;
             }
+            else
+            {
+                layerHeight = Mathf.RoundToInt((float)Mathf.Max(1, layer.amount) / totalAmount * _height);
+                layerHeight = Mathf.Min(layerHeight, _height - currentY);
+            }
+
+            int endY = currentY + layerHeight;
+            for (int y = currentY; y < endY; y++)
+            {
+                for (int x = 0; x < _width; x++)
+                {
+                    uint shade = (uint)((x * 7 + y * 13) & (SandPalette.Shades - 1));
+                    initialData[y * _width + x] = (uint)typeId | (shade << 4);
+                }
+            }
+
+            currentY = endY;
         }
 
-        _typeCounts[1] = total;
         _current.SetData(initialData);
         _next.SetData(initialData);
 
         RenderTextureUpdate();
+    }
+
+    public void Init(SandColor color)
+    {
+        Init(new[] { new GridSandSource.SandLayer { color = color, amount = 100 } });
     }
 
     public void ClearAll()
@@ -273,11 +317,12 @@ public class GridSand : MonoBehaviour
     }
 
     /// <summary>
-    /// Erases all sand particles in the given GPU pixel rectangle.
+    /// Erases sand particles matching eraseType in the given GPU pixel rectangle and returns the count of erased particles.
+    /// If maxCount > 0, caps the number of particles erased to avoid over-erasing.
     /// </summary>
-    public void EraseRegion(RectInt pixelBounds, int eraseType = 0)
+    public int EraseRegion(RectInt pixelBounds, int eraseType = 0, int maxCount = 0)
     {
-        if (_current == null || _shader == null) return;
+        if (_current == null || _shader == null || _eraseCountBuffer == null) return 0;
 
         int xMin = pixelBounds.xMin;
         int xMax = pixelBounds.xMax - 1;
@@ -286,19 +331,28 @@ public class GridSand : MonoBehaviour
 
         int spanX = xMax - xMin + 1;
         int spanY = yMax - yMin + 1;
-        if (spanX <= 0 || spanY <= 0) return;
+        if (spanX <= 0 || spanY <= 0) return 0;
 
         int ex = Mathf.CeilToInt(spanX / 8f);
         int ey = Mathf.CeilToInt(spanY / 8f);
+
+        _eraseCountData[0] = 0;
+        _eraseCountBuffer.SetData(_eraseCountData);
 
         _shader.SetInt("EraseXMin", xMin);
         _shader.SetInt("EraseXMax", xMax);
         _shader.SetInt("EraseYMin", yMin);
         _shader.SetInt("EraseYMax", yMax);
         _shader.SetInt("EraseType", eraseType);
+        _shader.SetInt("EraseMaxCount", maxCount > 0 ? maxCount : 0);
         _shader.SetBuffer(_kErase, "Current", _current);
         _shader.SetBuffer(_kErase, "Next",    _next);
+        _shader.SetBuffer(_kErase, "ErasedCount", _eraseCountBuffer);
         _shader.Dispatch(_kErase, ex, ey, 1);
+
+        _eraseCountBuffer.GetData(_eraseCountData);
+        int count = (int)_eraseCountData[0];
+        return maxCount > 0 ? Mathf.Min(count, maxCount) : count;
     }
 
     public int EraseNearBorder(int cxMin, int cxMax, int cyMin, int cyMax, Side side, int maxCount, int targetTypeId)
@@ -361,6 +415,7 @@ public class GridSand : MonoBehaviour
         _current?.Release();
         _next?.Release();
         _claims?.Release();
+        _eraseCountBuffer?.Release();
         if (_texture != null) _texture.Release();
     }
 }

@@ -20,20 +20,19 @@ public class GridSandSource : MonoBehaviour
 
     [Header("Sand Simulation")]
     [SerializeField] private GridSand _sand;
+    [SerializeField] private uint depth = 2;
+    [SerializeField] private GridObject _gridObject;
+    [SerializeField] private int _stepsPerFrame = 1;
 
 #if UNITY_EDITOR
     [Header("Debug")]
     [SerializeField] private bool _drawGizmos = true;
 #endif
 
-    [Header("Grid Object Reference")]
-    [SerializeField] private GridObject _gridObject;
-
-    [Header("Simulation Settings")]
-    [SerializeField] private int _stepsPerFrame = 1;
 
     // Connected receivers and their contact border points on this source
     private readonly Dictionary<GridSandReceiver, List<GridConnectionPoint>> _connections = new();
+    private readonly List<GridSandReceiver> _tempReceiverList = new();
 
     public event Action<GridSandReceiver, IReadOnlyList<GridConnectionPoint>> OnConnected;
     public event Action<GridSandReceiver> OnDisconnected;
@@ -67,13 +66,39 @@ public class GridSandSource : MonoBehaviour
 
         if (HasConnections)
         {
-            foreach (var pair in _connections)
+            _tempReceiverList.Clear();
+            _tempReceiverList.AddRange(_connections.Keys);
+
+            for (int r = 0; r < _tempReceiverList.Count; r++)
             {
-                var points = pair.Value;
+                var receiver = _tempReceiverList[r];
+                if (receiver == null || receiver.IsFull) continue;
+                if (!_connections.TryGetValue(receiver, out var points)) continue;
+
+                int remainingCapacity = receiver.Capacity - receiver.CurrentAmount;
+                if (remainingCapacity <= 0) continue;
+
+                int targetTypeId = 0;
+                if (receiver.TargetColor != null)
+                {
+                    targetTypeId = _sand.Palette != null ? _sand.Palette.GetColorTypeId(receiver.TargetColor) : -1;
+                }
+
+                if (targetTypeId < 0) continue;
+
+                int totalErased = 0;
                 for (int i = 0; i < points.Count; i++)
                 {
-                    RectInt bounds = _sand.GetConnectionPixelBounds(points[i], _gridObject);
-                    _sand.EraseRegion(bounds);
+                    int canErase = remainingCapacity - totalErased;
+                    if (canErase <= 0) break;
+
+                    RectInt bounds = _sand.GetConnectionPixelBounds(points[i], _gridObject, (int)depth);
+                    totalErased += _sand.EraseRegion(bounds, targetTypeId, canErase);
+                }
+
+                if (totalErased > 0)
+                {
+                    receiver.AddAmount(totalErased);
                 }
             }
         }
