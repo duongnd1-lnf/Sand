@@ -41,10 +41,10 @@ public class GridSandReceiver : MonoBehaviour
         _gridObject = GetComponent<GridObject>();
     }
 
-    //private void OnDestroy()
-    //{
-    //    Disconnect();
-    //}
+    private void OnDestroy()
+    {
+        SessionManager.Instance?.RemoveReceiver(this);
+    }
 
     private bool _isClearing;
 
